@@ -29,3 +29,9 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local agent/contributor notes (kept out of the published repository)
+AGENTS.md
+GOTCHAS.md
+PROJECT-GUIDE.md
+RELEASE-GUIDE.md
