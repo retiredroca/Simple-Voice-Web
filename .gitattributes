@@ -1,0 +1,8 @@
+# This repository also hosts a published Maven repository under repo/.
+# Store everything byte-for-byte so Gradle-generated checksums stay valid.
+* -text
+
+# Version/state files are read by CI with grep/cut, so keep them LF: a trailing \r would leak into
+# the version strings and break the publish file globs.
+versions.properties text eol=lf
+release-state.properties text eol=lf

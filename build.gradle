@@ -1,0 +1,248 @@
+plugins {
+    id 'base'
+}
+
+apply from: new File(projectDir, 'gradle/versions.gradle')
+
+def mc = providers.gradleProperty('mc').getOrElse('1.21.1')
+def versionRoot = "versions/${mc}"
+
+// Discover modules under versions/<mc>/ (any directory with fabric/ + neoforge/ sources).
+def moduleDirs = (file(versionRoot).listFiles() ?: new File[0])
+        .findAll { it.isDirectory() && new File(it, 'fabric').exists() && new File(it, 'neoforge').exists() }
+        .sort { it.name }
+
+def loadModule = { File moduleDir ->
+    def p = new Properties()
+    new File(moduleDir, 'module.properties').withInputStream { p.load(it) }
+    return p
+}
+
+// Exact, version-pinned jar lookups so a stale jar from an earlier build can never be picked.
+def versionedJar = { String path ->
+    def f = file(path)
+    f.exists() ? f : null
+}
+
+def dependOnBuilds = { org.gradle.api.Task t, String id ->
+    t.dependsOn gradle.includedBuild("${id}-fabric").task(':build')
+    t.dependsOn gradle.includedBuild("${id}-neoforge").task(':build')
+}
+
+def universalTasks = []
+
+moduleDirs.each { moduleDir ->
+    def props = loadModule(moduleDir)
+    def id = props.getProperty('id')
+    def groupPath = props.getProperty('group').replace('.', '/')
+    def modVersion = stampVersion(componentVersions.getProperty(id))
+    def fabricJar = { versionedJar("${versionRoot}/${moduleDir.name}/fabric/build/libs/${jarFileName(id, modVersion, 'fabric')}") }
+    def neoforgeJar = { versionedJar("${versionRoot}/${moduleDir.name}/neoforge/build/libs/${jarFileName(id, modVersion, 'neoforge')}") }
+
+    def t = tasks.register("universalJar_${id.replaceAll('[^A-Za-z0-9]', '_')}", Jar) {
+        dependOnBuilds(delegate, id)
+        archiveFileName = jarFileName(id, modVersion, 'universal')
+        destinationDirectory = layout.buildDirectory.dir('libs')
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+        // Fabric half: fabric classes + relocated common + fabric.mod.json.
+        from({ def f = fabricJar(); f == null ? [] : zipTree(f) })
+        // NeoForge-only classes + metadata. The module's NeoForge side has two class roots: its loader
+        // tree, which sits at <group>/<id>/neoforge when several modules share one group and at
+        // <group>/neoforge when a module's package root is its group, and the relocated common, which
+        // is always under <group>/neoforge/common. In this single-module layout the loader root is the
+        // second of those, so the <id> pattern matches nothing here; it is kept so every copy of this
+        // task reads alike. The mixin config and refmap sit at the jar root, so they go in by name.
+        from({ def f = neoforgeJar(); f == null ? [] : zipTree(f) }) {
+            include "${groupPath}/neoforge/**"
+            include "${groupPath}/${id}/neoforge/**"
+            include 'META-INF/neoforge.mods.toml'
+            include 'META-INF/accesstransformer.cfg'
+            include '**/*.mixins.json'
+            include '**/*refmap.json'
+        }
+    }
+    universalTasks << t
+}
+
+// --- staged release groups, then the union ------------------------------------------------------
+// A single-mod project has no bundles, so only the universal groups apply:
+//   1 releaseUniversal        build/release-universal/        (merged universal jars)
+//   2 releaseUniversalBundles build/release-universal-bundles/ (none here; no bundles.properties)
+// releaseLoaderJars / releaseLoaderBundles build the per-loader jars and their sources for one loader
+// only (-Ploader=fabric|neoforge). releaseJars is the ordered union of all four into build/release/.
+def loaderFilter = (findProperty('loader') ?: '').toString().toLowerCase()
+def activeLoaders = loaderFilter ? [loaderFilter] : ['fabric', 'neoforge']
+
+def loaderJarSources = { org.gradle.api.tasks.Sync t ->
+    moduleDirs.each { moduleDir ->
+        def id = loadModule(moduleDir).getProperty('id')
+        def modVersion = stampVersion(componentVersions.getProperty(id))
+        activeLoaders.each { loader ->
+            t.dependsOn gradle.includedBuild("${id}-${loader}").task(':build')
+            t.from({ versionedJar("${versionRoot}/${moduleDir.name}/${loader}/build/libs/${jarFileName(id, modVersion, loader)}") }) {
+                rename { jarFileName(id, modVersion, loader) }
+            }
+            // The sources jar travels with the mod jar it belongs to. It is renamed to carry its
+            // loader here, and only here: both loaders name it <id>-<version>-sources.jar because
+            // that is what a maven consumer looks for, so flattening the two into one directory
+            // would collide. The release is the only place they sit side by side.
+            t.from({ versionedJar("${versionRoot}/${moduleDir.name}/${loader}/build/libs/${jarFileName(id, modVersion, 'sources')}") }) {
+                rename { jarFileName(id, modVersion, "${loader}-sources") }
+            }
+        }
+    }
+}
+
+tasks.register('releaseLoaderJars', Sync) {
+    into layout.buildDirectory.dir('release-loader')
+    loaderJarSources(delegate)
+}
+
+tasks.register('releaseLoaderBundles', Sync) {
+    into layout.buildDirectory.dir('release-loader-bundles')
+    // No bundles in a single-mod project; the group stays for a uniform release contract.
+}
+
+tasks.register('releaseUniversal', Sync) {
+    into layout.buildDirectory.dir('release-universal')
+    universalTasks.each { task ->
+        dependsOn task
+        from(task)
+    }
+}
+
+tasks.register('releaseUniversalBundles', Sync) {
+    into layout.buildDirectory.dir('release-universal-bundles')
+    // No bundles in a single-mod project.
+}
+
+// The union of the four staged directories, as one task.
+//
+// This was four hand-rolled copy tasks, and it was wrong in two ways that both showed up as a
+// stale build/release/ rather than as an error:
+//   - each one declared its OUTPUT directory but never its input, so `dependsOn` ordered the work
+//     without saying what the task read. Once build/release/ existed, Gradle found the output
+//     snapshot unchanged and skipped the copy permanently: a new version stamp landed in
+//     build/release-loader/ while build/release/ went on serving the previous stamp.
+//   - nothing removed what was no longer produced, so each earlier stamp accumulated there as well.
+// A Sync over all four directories fixes both: the inputs are declared, and the destination is
+// emptied of anything this task did not put there. Sync also cannot be four tasks sharing one
+// output directory, which is why this is one task rather than four Syncs.
+def releaseGroups = ['releaseLoaderJars', 'releaseLoaderBundles', 'releaseUniversal',
+                     'releaseUniversalBundles']
+
+tasks.register('releaseJars', Sync) {
+    releaseGroups.each { name ->
+        def group = tasks.named(name)
+        dependsOn group
+        from(group)
+    }
+    into layout.buildDirectory.dir('release')
+
+    // Fail loudly if any module jar is missing, rather than silently assembling an incomplete set: a
+    // release built without one of its members is worse than a build that stops. Derived from the
+    // discovered modules and the active loaders, so a new module or a -Ploader run needs no list here.
+    doFirst {
+        def missing = []
+        moduleDirs.each { moduleDir ->
+            def id = loadModule(moduleDir).getProperty('id')
+            def modVersion = stampVersion(componentVersions.getProperty(id))
+            activeLoaders.each { loader ->
+                def jar = versionedJar("${versionRoot}/${moduleDir.name}/${loader}/build/libs/" +
+                        "${jarFileName(id, modVersion, loader)}")
+                if (jar == null) {
+                    missing << "${id}-${loader}"
+                }
+                def sources = versionedJar("${versionRoot}/${moduleDir.name}/${loader}/build/libs/" +
+                        "${jarFileName(id, modVersion, 'sources')}")
+                if (sources == null) {
+                    missing << "${id}-${loader}-sources"
+                }
+            }
+        }
+        if (missing) {
+            throw new GradleException("releaseJars: missing module jar(s): ${missing}; " +
+                    "did every included build run?")
+        }
+    }
+}
+
+tasks.register('cleanLoader') {
+    delete layout.buildDirectory.dir('release-loader')
+    delete layout.buildDirectory.dir('release-loader-bundles')
+}
+
+tasks.register('cleanUniversal') {
+    delete layout.buildDirectory.dir('release-universal')
+    delete layout.buildDirectory.dir('release-universal-bundles')
+}
+
+// No library modules in the single template, but keep the task for a uniform release contract.
+tasks.register('publishLibrary') {
+    group = 'publishing'
+    description = 'Publishes library modules (library=true) to the in-repo maven (repo/).'
+    moduleDirs.each { moduleDir ->
+        def props = loadModule(moduleDir)
+        if ((props.getProperty('library') ?: 'false').toBoolean()) {
+            def id = props.getProperty('id')
+            dependsOn gradle.includedBuild("${id}-fabric").task(':publishMavenJavaPublicationToRepoRepository')
+            dependsOn gradle.includedBuild("${id}-neoforge").task(':publishMavenJavaPublicationToRepoRepository')
+        }
+    }
+}
+
+// Sweep the root build/libs down to this build's jars. The merged jar stages here, and nothing else
+// prunes it: the per-loader builds sweep their own directories, but this one is written by the release
+// groups themselves. It hangs off those groups rather than off `build`, because the release path -
+// tools/release.py, deploy.sh, the staged tasks - never runs `build`, so a guard attached there never
+// ran for a release and every stamp's jar stayed behind.
+tasks.register('sweepRootLibs') {
+    group = 'build'
+    description = 'Deletes jars in the root build/libs that this build did not produce.'
+    doLast {
+        def keep = moduleDirs.collect {
+            def mid = loadModule(it).getProperty('id')
+            jarFileName(mid, stampVersion(componentVersions.getProperty(mid)), 'universal').toString()
+        } as Set
+        def libs = layout.buildDirectory.dir('libs').get().asFile
+        libs.listFiles()?.each { f ->
+            if (f.isFile() && f.name.endsWith('.jar') && !keep.contains(f.name)) {
+                f.delete()
+            }
+        }
+    }
+}
+
+// Before anything writes into that directory, whichever group is invoked.
+['releaseLoaderJars', 'releaseLoaderBundles', 'releaseUniversal',
+ 'releaseUniversalBundles'].each { name ->
+    tasks.named(name) { dependsOn 'sweepRootLibs' }
+}
+
+tasks.named('build') {
+    dependsOn 'releaseJars'
+}
+
+// Cleaning at the root cleans every included build too.
+tasks.named('clean') {
+    moduleDirs.each { moduleDir ->
+        def id = loadModule(moduleDir).getProperty('id')
+        dependsOn gradle.includedBuild("${id}-fabric").task(':clean')
+        dependsOn gradle.includedBuild("${id}-neoforge").task(':clean')
+    }
+}
+
+apply from: new File(projectDir, 'gradle/version-resolver.gradle')
+
+// Refuse to build a release set on a feature branch that never took its own version line: its jars
+// would be named exactly like the released ones. Attached to the release tasks only, so ordinary
+// development (`./gradlew build`) is unaffected. The check reads git at execution time, so it works
+// the same in a worktree as in a plain checkout, and it is skipped on a detached HEAD (a CI
+// checkout, which is the release line by definition).
+['releaseLoaderJars', 'releaseLoaderBundles', 'releaseUniversal',
+ 'releaseUniversalBundles', 'releaseJars'].each { taskName ->
+    tasks.matching { it.name == taskName }.configureEach {
+        featureLineGuard(taskName)
+    }
+}

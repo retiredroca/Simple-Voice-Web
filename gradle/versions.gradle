@@ -1,0 +1,235 @@
+// Shared config/version loader for every build in this project.
+//
+//   versions.properties                       (repo root)   per-module versions: <module-id>=<version>
+//   versions/<mc>/version.properties                        Minecraft/loader/toolchain pins
+//   versions/<mc>/<module>/module.properties                 module identity (id/name/group/...)
+//
+// Every build finds the files it needs by walking up from its own projectDir, so a loader build
+// under versions/<mc>/<module>/<loader>/ resolves the right files with no hardcoded paths.
+
+def findUp = { String name ->
+    def d = projectDir
+    while (d != null && !new File(d, name).exists()) {
+        d = d.parentFile
+    }
+    d == null ? null : new File(d, name)
+}
+
+def loadProps = { File f ->
+    def p = new Properties()
+    if (f != null) {
+        f.withInputStream { p.load(it) }
+    }
+    return p
+}
+
+def versionsFile = findUp('versions.properties')
+if (versionsFile == null) {
+    throw new GradleException("versions.properties not found above ${projectDir}")
+}
+def componentVersions = loadProps(versionsFile)
+ext.componentVersions = componentVersions
+
+// Build-time version stamp. versions.properties may hold a bare "<major>.<minor>.<patch>" (before a
+// release) or an already-stamped "<major>.<minor>.<patch>.<yymmddhh>" (after one). A bare value is
+// stamped here, in the project's stamp timezone (TIMEZONE in tools/versioning.py), so built jars
+// always carry the full version. Override with -PversionStamp=<stamp>; disable with -Pnostamp=true.
+// Read a module-level string constant out of tools/versioning.py, so the value is declared once in
+// python rather than duplicated here where the two can silently drift apart.
+def pyConst = { String name, String fallback ->
+    def f = findUp('tools/versioning.py')
+    if (f == null) {
+        return fallback
+    }
+    def m = f.getText('UTF-8') =~ /(?m)^${name}\s*=\s*"([^"]+)"/
+    return m.find() ? m.group(1) : fallback
+}
+def stampTimezone = { pyConst('TIMEZONE', 'UTC') }
+def fixedOffsetZone = { String name ->
+    def t = name.trim().toUpperCase()
+    if (t in ['UTC', 'Z', 'GMT']) {
+        return java.time.ZoneOffset.UTC
+    }
+    def m = t =~ /^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$/
+    if (!m.matches()) {
+        return null
+    }
+    int sign = m.group(1) == '+' ? 1 : -1
+    int hours = m.group(2) as int
+    int minutes = (m.group(3) ?: '0') as int
+    return java.time.ZoneOffset.ofTotalSeconds(sign * (hours * 3600 + minutes * 60))
+}
+def resolveStampZone = { String name ->
+    def fixed = fixedOffsetZone(name)
+    if (fixed != null) {
+        return fixed
+    }
+    try {
+        return java.time.ZoneId.of(name)
+    } catch (Exception ignored) {
+        return java.time.ZoneOffset.UTC
+    }
+}
+def currentStamp = {
+    def override = project.findProperty('versionStamp')
+    if (override != null) {
+        return override.toString()
+    }
+    def zone = resolveStampZone(stampTimezone())
+    return java.time.ZonedDateTime.now(zone)
+            .format(java.time.format.DateTimeFormatter.ofPattern('yyMMddHH'))
+}
+def stampVersion = { String version ->
+    if (version == null || project.findProperty('nostamp') != null) {
+        return version
+    }
+    return version.tokenize('.').size() >= 4 ? version : "${version}.${currentStamp()}"
+}
+ext.stampVersion = stampVersion
+
+// --- version ordering -----------------------------------------------------------------------------------
+// The one place a version string becomes a comparable key. Every ordering decision -- which
+// component a bundle takes its version from, which maven-metadata entry is newest, which loader
+// version to resolve -- goes through here, so a change to what a version means is a change in one
+// file. It lives in versions.gradle rather than version-resolver.gradle because versions.gradle is
+// applied first by every build; a comparator defined in a script applied at the end is not available
+// to the code above it, which is what previously forced a second copy into build.gradle.
+//
+// Cast, do not compare strings. A decimal component has no fixed width, so lexical order and numeric
+// order must not be assumed to agree: '9' sorts after '10'. tokenize('.-+') and toInteger() make
+// 1.0.9 < 1.0.10 and 1.0.99 < 1.0.100, at any width, with no zero-padding on the versions.
+ext.versionKey = { String v -> v.tokenize('.-+').collect { it.isInteger() ? it.toInteger() : 0 } }
+ext.compareVersions = { String a, String b ->
+    def ka = versionKey(a)
+    def kb = versionKey(b)
+    for (int i = 0; i < Math.max(ka.size(), kb.size()); i++) {
+        def x = i < ka.size() ? ka[i] : 0
+        def y = i < kb.size() ? kb[i] : 0
+        if (x != y) {
+            return x <=> y
+        }
+    }
+    0
+}
+ext.maxVersion = { List<String> versions ->
+    // copy before sorting: sort() mutates in place, and a caller passing a shared list would see it
+    // reordered as a side effect.
+    versions ? new ArrayList(versions).sort { a, b -> compareVersions(a, b) }.last() : null
+}
+
+
+// Per-version Minecraft/toolchain pins, exposed under their original names so build scripts can
+// use ${minecraft_version}, ${loader_version}, ${neo_version}, etc. unchanged.
+def versionFile = findUp('version.properties')
+if (versionFile != null) {
+    def versionPins = loadProps(versionFile)
+    ['minecraft_version', 'loader_version', 'fabric_version',
+     'neo_version', 'neo_version_range', 'java_version', 'toolchain_era',
+     'voicechat_api_version', 'voicechat_version'].each { key ->
+        def value = versionPins.getProperty(key)
+        if (value != null) {
+            ext.set(key, value)
+        }
+    }
+    ext.versionPropsFile = versionFile
+    ext.targetMc = versionFile.parentFile.name
+}
+
+// Module identity (only present inside versions/<mc>/<module>/...).
+def moduleFile = findUp('module.properties')
+if (moduleFile != null) {
+    def module = loadProps(moduleFile)
+    ext.moduleProperties = module
+    ext.mod_id = module.getProperty('id')
+    ext.mod_name = module.getProperty('name')
+    ext.mod_group_id = module.getProperty('group')
+    ext.mod_authors = module.getProperty('authors')
+    ext.mod_license = module.getProperty('license')
+    ext.mod_description = module.getProperty('description')
+    ext.mod_version = stampVersion(componentVersions.getProperty(ext.mod_id))
+    ext.mod_library = (module.getProperty('library') ?: 'false').toBoolean()
+}
+
+// Release jar name: <mod-id>-<version>-<loader>.jar, e.g. redstonepcbs-1.0.1.26092517-fabric.jar.
+// The loader designation is the trailing element, matching the universal jar's own
+// "-universal" suffix, so all three release jars read alike. This is the one copy of the convention:
+// the root build's jar lookups and each loader build's archiveFileName both come from here, so the
+// two cannot drift apart. The id and version are parameters because the root project has no
+// module.properties above it, so mod_id/mod_version are undefined there.
+//
+// The project abbreviation (abbrev in versions.properties) is prepended so jars from different
+// projects cannot collide when installed side by side. It is empty for a single-module project.
+def abbrev = (componentVersions.getProperty('abbrev') ?: '').trim()
+ext.jarFileName = { String id, String version, String loader ->
+    "${abbrev ? abbrev + '-' : ''}${id}-${version}-${loader}.jar"
+}
+
+// A dependency's floor range: [<major.minor.patch>,<upper>). Unused in a single-mod project, but
+// kept so the loader builds share one script shape with the multi template.
+ext.floorUpper = pyConst('FLOOR_UPPER', '1.1')   // single source: tools/versioning.py
+// --- feature-line guard ---------------------------------------------------------------------------------
+// A feature branch must be on its own version line, or its jars are indistinguishable by filename
+// from the released line's and a test instance cannot tell them apart. The bump is the tooling's
+// job (release.py --bump); this refuses to produce a jar when it has not happened.
+//
+// The test is "has this branch modified versions.properties since it diverged from the release
+// line?", NOT "does its patch differ from main's": a branch stacked on another feature branch
+// inherits that branch's number without ever having bumped, and a patch-equality test would call it
+// clean. merge-base answers it exactly, and works the same in a worktree (no checkout event fires
+// there) as in a plain checkout.
+//
+// Wired to the release tasks only, so ordinary development is unaffected. Detached HEAD means a CI
+// checkout, which is the release line by definition. -PallowUnbumped=true is the escape hatch for
+// reproducing or bisecting a release build; it is logged rather than silent.
+ext.featureLineGuard = { String taskName ->
+    if (project.findProperty('allowUnbumped') != null) {
+        logger.lifecycle("mechanics: -PallowUnbumped=true set, skipping the feature-line check for ${taskName}")
+        return
+    }
+    def git = { List<String> args ->
+        def p = ['git'] + args
+        try {
+            def proc = new ProcessBuilder(p).directory(rootProject.projectDir).redirectErrorStream(true).start()
+            def out = proc.inputStream.text.trim()
+            proc.waitFor()
+            return proc.exitValue() == 0 ? out : null
+        } catch (Exception ignored) {
+            return null
+        }
+    }
+    // Not a git checkout, or not on a branch: nothing to compare against.
+    def branch = git(['rev-parse', '--abbrev-ref', 'HEAD'])
+    if (branch == null || branch == '' || branch == 'HEAD' || branch == 'main') {
+        return
+    }
+    def base = git(['merge-base', 'HEAD', 'main'])
+    if (base == null || base == '') {
+        return
+    }
+    def here = versionsFile == null ? null : versionsFile.getText('UTF-8')
+    def there = git(['show', base + ':versions.properties'])
+    if (here == null || there == null) {
+        return
+    }
+    if (here.trim() == there.trim()) {
+        throw new GradleException(
+            """Feature branch '${branch}' is still on the release line's version.
+  Its jars would be named exactly like the released ones, so a test instance cannot tell a
+  branch build from the release. Give this branch its own line, then rebuild:
+
+      python tools/release.py --mod all --bump patch --commit
+
+  Use --bump minor or --bump major if the line should start above a patch. To reproduce or
+  bisect a release build on purpose, pass -PallowUnbumped=true.""")
+    }
+    logger.lifecycle("mechanics: feature branch '${branch}' is on its own version line")
+}
+
+ext.moduleFloor = { String id ->
+    def version = componentVersions.getProperty(id)
+    if (version == null) {
+        throw new GradleException("versions.properties has no '${id}=' entry")
+    }
+    def bound = version.tokenize('.').take(3).join('.')
+    "[${bound},${floorUpper})"
+}

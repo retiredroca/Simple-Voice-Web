@@ -1,0 +1,36 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+        maven {
+            url = 'https://maven.neoforged.net/releases'
+        }
+    }
+}
+
+rootProject.name = 'simplevoiceweb'
+
+// Multi-version, directory-per-version layout. Select the Minecraft version with
+// `-Pmc=<version>` (default 1.21.1). Only that version's builds are included, which keeps
+// configuration fast and focuses the IDE on one version at a time.
+def mc = providers.gradleProperty('mc').getOrElse('1.21.1')
+def versionRoot = file("versions/${mc}")
+if (!versionRoot.exists()) {
+    throw new GradleException("Unknown Minecraft version '${mc}' (${versionRoot} does not exist). " +
+            "Create it with: ./gradlew newVersion -Pnew=${mc}")
+}
+
+// Each module under versions/<mc>/ is a directory with common/, fabric/ and neoforge/ sources.
+// Fabric Loom and NeoGradle cannot share one Gradle project, so fabric/ and neoforge/ are
+// included builds with Minecraft-scoped names (to avoid collisions when several modules exist).
+versionRoot.listFiles()
+        ?.findAll { it.isDirectory() && new File(it, 'fabric').exists() && new File(it, 'neoforge').exists() }
+        ?.sort { it.name }
+        ?.each { module ->
+            includeBuild("versions/${mc}/${module.name}/fabric") { name = "${module.name}-fabric" }
+            includeBuild("versions/${mc}/${module.name}/neoforge") { name = "${module.name}-neoforge" }
+        }
