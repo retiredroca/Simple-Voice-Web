@@ -57,16 +57,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist
-          gh release download '${{ inputs.release_tag }}' --dir dist --pattern '*.jar' --clobber
-          ls -la dist
+          rm -rf "dist/${MC_VERSION}"
+          mkdir -p "dist/${MC_VERSION}"
+          gh release download '${{ inputs.release_tag }}' --dir "dist/${MC_VERSION}" --pattern '*.jar' --clobber
+          ls -la "dist/${MC_VERSION}"
           # mc-publish defaults its `files` glob to build/libs/*.jar, so stage the downloaded
           # release jars there too.
           mkdir -p build/libs
           # Only the mod jars: a sources jar is not a platform artifact, and mc-publish's
           # default `files` glob over build/libs would pick one up.
-          for jar in dist/*.jar; do
+          for jar in "dist/${MC_VERSION}"/*.jar; do
             case "$jar" in *-sources.jar) continue ;; esac
             cp "$jar" build/libs/
           done
@@ -85,16 +85,16 @@ jobs:
           print(release.expected_jars('${MC_VERSION}'))
           ")
           allowed='^[A-Za-z0-9_-]+-[0-9][0-9.]*-(fabric|neoforge|universal)(-sources)?\.jar$'
-          bad=$(ls -1 dist | grep -vE "$allowed" || true)
+          bad=$(ls -1 "dist/${MC_VERSION}" | grep -vE "$allowed" || true)
           if [ -n "$bad" ]; then
-            echo "Unexpected file(s) in dist/ (refusing to publish):" >&2
+            echo "Unexpected file(s) in dist/${MC_VERSION}/ (refusing to publish):" >&2
             echo "$bad" >&2
             exit 1
           fi
-          count=$(ls -1 dist/*.jar | wc -l)
+          count=$(ls -1 "dist/${MC_VERSION}"/*.jar | wc -l)
           if [ "$count" -ne "$expected" ]; then
             echo "Expected ${expected} release jars, found ${count}:" >&2
-            ls -la dist >&2
+            ls -la "dist/${MC_VERSION}" >&2
             exit 1
           fi
           echo "Release jar set OK ($count files)"
@@ -112,6 +112,7 @@ jobs:
           import versioning
 
           tag = os.environ['RELEASE_TAG']
+          mc = os.environ['MC_VERSION']
           text = (versioning.ROOT / 'versions.properties').read_text(encoding='utf-8')
           versions = {}
           for line in text.splitlines():
@@ -123,9 +124,9 @@ jobs:
           def git(*args):
               return subprocess.run(['git', *args], capture_output=True, text=True).stdout
 
-          prev = git('describe', '--tags', '--abbrev=0', f'{tag}^').strip()
+          prev = git('describe', '--tags', '--abbrev=0', '--match', f'v*-{mc}', f'{tag}^').strip()
           if not prev:
-              print('No previous tag; treating the component as changed.')
+              print(f'No previous tag for Minecraft {mc}; treating the component as changed.')
               changed = set(versions)
           else:
               print(f'Diffing versions.properties: {prev}..{tag}')
@@ -161,8 +162,8 @@ jobs:
             echo
             echo
             echo "Full changelog: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
-          } > dist/changelog.md
-          cat dist/changelog.md
+          } > "dist/${MC_VERSION}/changelog.md"
+          cat "dist/${MC_VERSION}/changelog.md"
 
       # --- CurseForge: one entry per release, with the universal jar ---------------------------
       - name: CurseForge
@@ -171,11 +172,11 @@ jobs:
         with:
           curseforge-id: ${{ vars.CURSEFORGE_ID }}
           curseforge-token: ${{ secrets.CURSEFORGE_API_KEY }}
-          curseforge-files: dist/${{ env.ABBREV_PREFIX }}${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}-universal.jar
+          curseforge-files: dist/${{ env.MC_VERSION }}/${{ env.ABBREV_PREFIX }}${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}-universal.jar
           curseforge-dependencies: fabric-api(required){modrinth:P7dR8mSH}{curseforge:306612}
           name: ${{ env.PRIMARY }} ${{ env.PRIMARY_VERSION }}
           version: ${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}
-          changelog-file: dist/changelog.md
+          changelog-file: dist/${{ env.MC_VERSION }}/changelog.md
           version-type: release
           game-versions: ${{ env.MC_VERSION }}
           loaders: |
@@ -199,7 +200,7 @@ jobs:
           ./.github/scripts/modrinth-sync.sh \
             "${MODRINTH_ID}" \
             "mr.${PRIMARY}.version.${MC_VERSION}" "${PRIMARY_VERSION}" "${PRIMARY} ${PRIMARY_VERSION}" \
-            "dist/${A}${PRIMARY}-${PRIMARY_VERSION}-universal.jar"
+            "dist/${MC_VERSION}/${A}${PRIMARY}-${PRIMARY_VERSION}-universal.jar"
 
       # --- Persist the bumped version / learned Modrinth id back to main -----------------------
       - name: Commit version + release state

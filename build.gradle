@@ -70,7 +70,7 @@ moduleDirs.each { moduleDir ->
 //   1 releaseUniversal        build/release-universal/        (merged universal jars)
 //   2 releaseUniversalBundles build/release-universal-bundles/ (none here; no bundles.properties)
 // releaseLoaderJars / releaseLoaderBundles build the per-loader jars and their sources for one loader
-// only (-Ploader=fabric|neoforge). releaseJars is the ordered union of all four into build/release/.
+// only (-Ploader=fabric|neoforge). releaseJars is the ordered union of all four into build/release/<mc>/.
 def loaderFilter = (findProperty('loader') ?: '').toString().toLowerCase()
 def activeLoaders = loaderFilter ? [loaderFilter] : ['fabric', 'neoforge']
 
@@ -120,11 +120,11 @@ tasks.register('releaseUniversalBundles', Sync) {
 // The union of the four staged directories, as one task.
 //
 // This was four hand-rolled copy tasks, and it was wrong in two ways that both showed up as a
-// stale build/release/ rather than as an error:
+// stale build/release/<mc>/ rather than as an error:
 //   - each one declared its OUTPUT directory but never its input, so `dependsOn` ordered the work
-//     without saying what the task read. Once build/release/ existed, Gradle found the output
+//     without saying what the task read. Once build/release/<mc>/ existed, Gradle found the output
 //     snapshot unchanged and skipped the copy permanently: a new version stamp landed in
-//     build/release-loader/ while build/release/ went on serving the previous stamp.
+//     build/release-loader/ while build/release/<mc>/ went on serving the previous stamp.
 //   - nothing removed what was no longer produced, so each earlier stamp accumulated there as well.
 // A Sync over all four directories fixes both: the inputs are declared, and the destination is
 // emptied of anything this task did not put there. Sync also cannot be four tasks sharing one
@@ -138,7 +138,7 @@ tasks.register('releaseJars', Sync) {
         dependsOn group
         from(group)
     }
-    into layout.buildDirectory.dir('release')
+    into layout.buildDirectory.dir("release/${mc}")
 
     // Fail loudly if any module jar is missing, rather than silently assembling an incomplete set: a
     // release built without one of its members is worse than a build that stops. Derived from the

@@ -13,7 +13,7 @@ on:
         description: 'Release tag to (re)publish (leading "v" optional). Leave blank for the latest release.'
         required: false
       minecraft:
-        description: 'Minecraft version (folder under versions/)'
+        description: 'Minecraft version; only needed for tags without a -<mc> suffix'
         default: '1.21.1'
 
 permissions:
@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      mc: ${{ steps.tag.outputs.mc }}
     steps:
       - id: tag
         env:
@@ -49,13 +50,28 @@ jobs:
             v*) ;;
             *) tag="v$tag" ;;
           esac
-          echo "Publishing $tag"
+          mc=''
+          case "$tag" in
+            *-*) mc="${tag##*-}" ;;
+          esac
+          if [ -z "$mc" ]; then
+            mc='${{ github.event.inputs.minecraft }}'
+          fi
+          if [ -z "$mc" ]; then
+            echo "Tag $tag has no Minecraft suffix and no minecraft input was given." >&2
+            exit 1
+          fi
+          case "$mc" in
+            *[!A-Za-z0-9._-]*) echo "Invalid Minecraft version from tag: $mc" >&2; exit 1 ;;
+          esac
+          echo "Publishing $tag for Minecraft $mc"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mc=$mc" >> "$GITHUB_OUTPUT"
 
   publish:
     needs: resolve
     uses: ./.github/workflows/release-mod.yml
     with:
       release_tag: ${{ needs.resolve.outputs.tag }}
-      minecraft: ${{ github.event.inputs.minecraft || '1.21.1' }}
+      minecraft: ${{ needs.resolve.outputs.mc }}
     secrets: inherit

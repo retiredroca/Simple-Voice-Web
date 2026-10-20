@@ -166,7 +166,7 @@ can detect the JDK 25 installation; if it cannot, set `org.gradle.java.installat
 
 Both versions use the same sources. 26.3 is the deobfuscated generation and builds with the renamed
 `net.fabricmc.fabric-loom` plugin for Fabric and ModDevGradle for NeoForge; 1.21.1 uses Loom 1.9.2
-and NeoGradle. The release artifacts are `build/release/`:
+and NeoGradle. Each `-Pmc` writes its own release set under `build/release/<mc>/`:
 
 - `*-fabric.jar` and `*-neoforge.jar` - per-loader.
 - `*-universal.jar` - one jar for both loaders.
