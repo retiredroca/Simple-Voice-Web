@@ -11,8 +11,9 @@ a per-speaker gain from positions it already has.
 
 ## Requirements
 
-- Minecraft Java Edition **1.21.1** server, Fabric or NeoForge.
-- [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat) **2.6.0 or newer** on the server.
+- Minecraft Java Edition **1.21.1 or 26.3** server, Fabric or NeoForge.
+- [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat) **2.6.0 or newer** on the server
+  (the 26.3 build requires **2.6.24**, the SVC version for that Minecraft release).
 - A modern browser with WebCodecs audio over **HTTPS** (or `http://localhost`): current Chrome,
   Edge, Firefox or Safari. Browsers only allow microphone capture and WebCodecs in a secure context,
   so the page must be served over TLS.
@@ -154,12 +155,18 @@ travel in clear text.
 ## Building
 
 ```bash
-./gradlew -Pmc=1.21.1 build
+./gradlew -Pmc=1.21.1 build   # Java 21 toolchain
+./gradlew -Pmc=26.3 build     # Java 25 toolchain (modern, deobfuscated generation)
 ```
 
-Gradle must run on JDK 17–23; the mod itself targets Java 21.
+Gradle 9.5.1 runs on JDK 21 or 25. The 1.21.1 build compiles with a Java 21 toolchain and the
+26.3 build with Java 25, so both JDKs must be available. Run Gradle on JDK 21 and make sure Gradle
+can detect the JDK 25 installation; if it cannot, set `org.gradle.java.installations.paths` in
+`gradle.properties`.
 
-The release artifacts are `build/release/`:
+Both versions use the same sources. 26.3 is the deobfuscated generation and builds with the renamed
+`net.fabricmc.fabric-loom` plugin for Fabric and ModDevGradle for NeoForge; 1.21.1 uses Loom 1.9.2
+and NeoGradle. The release artifacts are `build/release/`:
 
 - `*-fabric.jar` and `*-neoforge.jar` - per-loader.
 - `*-universal.jar` - one jar for both loaders.

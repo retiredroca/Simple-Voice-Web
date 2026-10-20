@@ -1,0 +1,34 @@
+modLoader="javafml"
+loaderVersion="${loader_version_range}"
+license="${mod_license}"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+description='''
+Join a server's Simple Voice Chat proximity voice from a browser. Players without the mod get a
+keyed, single-use link and speak through a web page.
+'''
+
+[[dependencies.${mod_id}]]
+    modId="neoforge"
+    type="required"
+    versionRange="[${neo_version},)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    type="required"
+    versionRange="[${minecraft_version}]"
+    ordering="NONE"
+    side="BOTH"
+
+# The API floor: 2.6.0 is the first release with AudioSender and PlayerAudioListener.
+[[dependencies.${mod_id}]]
+    modId="voicechat_api"
+    type="required"
+    versionRange="[${voicechat_api_version},)"
+    ordering="AFTER"
+    side="BOTH"
