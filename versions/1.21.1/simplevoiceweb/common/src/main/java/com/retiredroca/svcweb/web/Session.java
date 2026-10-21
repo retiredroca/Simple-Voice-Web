@@ -3,14 +3,12 @@ package com.retiredroca.svcweb.web;
 import com.retiredroca.svcweb.SimpleVoiceWeb;
 import com.retiredroca.svcweb.tls.Json;
 import com.retiredroca.svcweb.voice.AudioBridge;
+import com.retiredroca.svcweb.voice.VoiceMixer;
 
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -19,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * One browser voice session: link redemption, the WebSocket handshake, and the message loop.
  *
- * <p>All voice chat calls are marshalled onto the server thread. The session's own state (the
+ * <p>World and player lookups are marshalled onto the server thread. The session's own state (the
  * socket, the sink) is guarded by this object, but it never holds a lock while calling into voice
  * chat: that would deadlock against the server thread the call is waiting on.
  */
@@ -33,7 +31,9 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
     private volatile UUID player;
     private volatile String displayName;
     private volatile boolean closed;
-    private final Set<UUID> announced = ConcurrentHashMap.newKeySet();
+    private volatile VoiceMixer mixer;
+    private final Map<UUID, Float> volumes = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> activity = new ConcurrentHashMap<>();
     private final BlockingQueue<Outgoing> outbound = new ArrayBlockingQueue<>(256);
     private volatile Thread writer;
 
@@ -92,6 +92,8 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
             upgrade.sendText("{\"type\":\"error\",\"message\":\"Voice chat could not attach this "
                     + "player. Make sure Simple Voice Chat is running and this client does not have "
                     + "the mod installed.\"}");
+        } else {
+            mixer();
         }
 
         startWriter();
@@ -124,9 +126,35 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
         }
         switch (type) {
             case "end", "mute" -> audio.endStream(player);
+            case "volume" -> handleVolume(json);
             default -> {
                 // Unknown messages are ignored: the protocol is one-way except for control.
             }
+        }
+    }
+
+    private void handleVolume(String json) {
+        try {
+            String value = Json.string(json, "uuid");
+            if (value == null) {
+                return;
+            }
+            UUID speaker = UUID.fromString(value);
+            Object raw = Json.asObject(Json.parse(json)).get("volume");
+            if (!(raw instanceof Number number)) {
+                return;
+            }
+            float volume = (float) Math.max(0D,
+                    Math.min(2D, number.doubleValue() / 100D));
+            volumes.put(speaker, volume);
+            synchronized (this) {
+                VoiceMixer current = mixer;
+                if (current != null) {
+                    current.setVolume(speaker, volume);
+                }
+            }
+        } catch (RuntimeException e) {
+            SimpleVoiceWeb.LOGGER.debug("Ignored invalid volume message: {}", e.getMessage());
         }
     }
 
@@ -142,42 +170,58 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
     }
 
     @Override
-    public void onProximity(UUID speaker, String speakerName, byte[] opus, float gain,
-                            boolean whispering) {
-        if (opus.length == 0 || socket == null) {
+    public void onAudio(AudioBridge.AudioFrame frame) {
+        if (frame == null || frame.speaker() == null || socket == null) {
             return;
         }
-        // Called on the voice chat thread. Never write to the socket here: one slow browser would
-        // stall audio for every listener. The queue is bounded and drops the oldest frame, which is
-        // the right behaviour for real-time audio.
-        if (announced.add(speaker)) {
-            enqueue(Outgoing.text("{\"type\":\"speaker\",\"uuid\":\"" + speaker
-                    + "\",\"name\":\"" + escape(speakerName == null ? speaker.toString() : speakerName)
-                    + "\",\"whispering\":" + whispering + "}"));
+        // Called on the voice chat thread. The mixer and socket writer do the blocking work.
+        VoiceMixer current = mixer();
+        if (current == null) {
+            return;
         }
-        enqueue(Outgoing.binary(audioFrame(speaker, gain, opus)));
+        current.offer(frame);
+        if (frame.end()) {
+            activity.remove(frame.speaker());
+            sendSpeaker(frame, false);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long last = activity.get(frame.speaker());
+        if (last == null || now - last >= 250L) {
+            activity.put(frame.speaker(), now);
+            sendSpeaker(frame, true);
+        }
     }
 
     /**
-     * One audio packet: {@code [0x01][speaker UUID 16][gain float32 big-endian][opus]}.
-     *
-     * <p>The gain is computed on the server from positions it already holds, so the browser never
-     * receives a coordinate.
+     * The mixer is created on first use. This also handles the case where voice chat starts after
+     * the web connection was accepted.
      */
-    private static byte[] audioFrame(UUID speaker, float gain, byte[] opus) {
-        ByteBuffer buffer = ByteBuffer.allocate(1 + 16 + 4 + opus.length)
-                .order(ByteOrder.BIG_ENDIAN);
-        buffer.put((byte) 0x01);
-        buffer.putLong(speaker.getMostSignificantBits());
-        buffer.putLong(speaker.getLeastSignificantBits());
-        buffer.putFloat(gain);
-        buffer.put(opus);
-        return buffer.array();
+    private synchronized VoiceMixer mixer() {
+        if (closed || player == null) {
+            return null;
+        }
+        if (mixer == null) {
+            VoiceMixer created = new VoiceMixer(audio, this::sendMixed);
+            for (Map.Entry<UUID, Float> entry : volumes.entrySet()) {
+                created.setVolume(entry.getKey(), entry.getValue());
+            }
+            created.start();
+            mixer = created;
+        }
+        return mixer;
     }
 
-    @Override
-    public void onGroup(UUID speaker, String speakerName, byte[] opus) {
-        onProximity(speaker, speakerName, opus, 1F, false);
+    private void sendMixed(byte[] data) {
+        if (data != null) {
+            enqueue(Outgoing.binary(data));
+        }
+    }
+
+    private void sendSpeaker(AudioBridge.AudioFrame frame, boolean speaking) {
+        enqueue(Outgoing.text("{\"type\":\"speaker\",\"uuid\":\"" + frame.speaker()
+                + "\",\"name\":\"" + escape(frame.speakerName() == null ? frame.speaker().toString()
+                : frame.speakerName()) + "\",\"speaking\":" + speaking + "}"));
     }
 
     @Override
@@ -251,11 +295,19 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
     }
 
     private void close(int code, String reason) {
-        if (closed) {
-            return;
+        VoiceMixer activeMixer;
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            activeMixer = mixer;
+            mixer = null;
         }
-        closed = true;
-        announced.clear();
+        if (activeMixer != null) {
+            activeMixer.close();
+        }
+        activity.clear();
         outbound.clear();
         Thread draining = writer;
         if (draining != null) {

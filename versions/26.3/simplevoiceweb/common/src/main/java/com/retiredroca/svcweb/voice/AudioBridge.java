@@ -12,6 +12,8 @@ import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.PlayerDisconnectedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
+import de.maxhenkel.voicechat.api.opus.OpusDecoder;
+import de.maxhenkel.voicechat.api.opus.OpusEncoder;
 import de.maxhenkel.voicechat.api.packets.EntitySoundPacket;
 import de.maxhenkel.voicechat.api.packets.SoundPacket;
 import de.maxhenkel.voicechat.api.packets.StaticSoundPacket;
@@ -28,10 +30,11 @@ import java.util.function.Function;
  * spoken, so proximity, permissions and groups all behave normally. {@link PlayerAudioListener}
  * receives every packet the player would have heard, including when the player has no voice chat
  * connection at all - {@code Server.sendSoundPacket} calls the listeners before it checks for one.
+ * The bridge also exposes SVC's Opus codecs for the server-side stereo mixer.
  *
  * <p><b>Privacy:</b> positions never leave the server. {@link EntitySoundPacket} carries only the
- * speaker's UUID and a distance, so the audible volume is computed here, from the web player's real
- * position and the speaker's, and sent as a single scalar. No coordinates, no direction.
+ * speaker's UUID and a distance. The listener's position is used here to place the speaker in a
+ * server-side stereo mix; the browser receives the mixed audio and never a coordinate or direction.
  */
 public final class AudioBridge {
 
@@ -47,13 +50,21 @@ public final class AudioBridge {
 
     private AudioBridge() {}
 
-    /** Receives decoded audio for one web listener. Implemented by the session. */
-    public interface Sink {
-        /** Opus-encoded audio from another player, with a precomputed linear gain in [0, 1]. */
-        void onProximity(UUID speaker, String speakerName, byte[] opus, float gain, boolean whispering);
+    /**
+     * One audible Opus packet. The spatial fields are computed on the server and never leave it;
+     * the web frame carries only the mixed stereo result.
+     */
+    public record AudioFrame(UUID speaker, String speakerName, byte[] opus, float gain,
+                             float pan, float elevation, boolean rear, boolean group,
+                             boolean whispering) {
+        public boolean end() {
+            return opus == null || opus.length == 0;
+        }
+    }
 
-        /** Opus-encoded group audio, which SVC plays at full volume. */
-        void onGroup(UUID speaker, String speakerName, byte[] opus);
+    /** Receives audio for one web listener. Implemented by the session. */
+    public interface Sink {
+        void onAudio(AudioFrame frame);
 
         /** The web player is speaking, so the browser can show it. */
         void onSpeaking(boolean speaking);
@@ -81,6 +92,18 @@ public final class AudioBridge {
 
     public boolean available() {
         return api != null;
+    }
+
+    /** Creates an Opus decoder, or returns {@code null} while voice chat is stopped. */
+    public synchronized OpusDecoder createDecoder() {
+        VoicechatServerApi current = api;
+        return current == null ? null : current.createDecoder();
+    }
+
+    /** Creates an Opus encoder, or returns {@code null} while voice chat is stopped. */
+    public synchronized OpusEncoder createEncoder() {
+        VoicechatServerApi current = api;
+        return current == null ? null : current.createEncoder();
     }
 
     /** Registers the SVC events. Called once, from the voice chat plugin. */
@@ -332,20 +355,22 @@ public final class AudioBridge {
             return;
         }
         byte[] opus = packet.getOpusEncodedData();
-        if (opus == null || opus.length == 0) {
-            // An empty payload ends a stream; forward it so the browser stops cleanly.
-            sink.onProximity(packet.getSender(), null, new byte[0], 0F, false);
-            return;
-        }
         UUID speaker = packet.getSender();
         if (speaker == null || speaker.equals(listener)) {
             return;
         }
         String name = nameOf(speaker);
+        if (opus == null || opus.length == 0) {
+            // An empty payload ends a stream; the mixer clears that speaker.
+            sink.onAudio(new AudioFrame(speaker, name, new byte[0], 0F, 0F, 0F, false,
+                    false, false));
+            return;
+        }
 
         if (packet instanceof StaticSoundPacket) {
             if (groups) {
-                sink.onGroup(speaker, name, opus);
+                sink.onAudio(new AudioFrame(speaker, name, opus, 1F, 0F, 0F, false, true,
+                        false));
             }
             return;
         }
@@ -361,7 +386,63 @@ public final class AudioBridge {
         if (gain <= 0F) {
             return;
         }
-        sink.onProximity(speaker, name, opus, gain, whispering);
+        Spatial spatial = spatial(listener, speaker);
+        sink.onAudio(new AudioFrame(speaker, name, opus, gain, spatial.pan(), spatial.elevation(),
+                spatial.rear(), false, whispering));
+    }
+
+    /** Relative direction of a speaker, in the listener's frame. */
+    private record Spatial(float pan, float elevation, boolean rear) {
+        static final Spatial CENTER = new Spatial(0F, 0F, false);
+    }
+
+    /**
+     * Places a speaker left/right, above/below and in front/behind the listener. The values stay on
+     * this side of the web socket; only the mixed stereo audio is sent.
+     */
+    private Spatial spatial(UUID listener, UUID speaker) {
+        try {
+            VoicechatServerApi serverApi = api;
+            if (serverApi == null) {
+                return Spatial.CENTER;
+            }
+            VoicechatConnection listenerConnection = serverApi.getConnectionOf(listener);
+            VoicechatConnection speakerConnection = serverApi.getConnectionOf(speaker);
+            if (listenerConnection == null || speakerConnection == null) {
+                return Spatial.CENTER;
+            }
+            ServerPlayer listenerPlayer = listenerConnection.getPlayer();
+            ServerPlayer speakerPlayer = speakerConnection.getPlayer();
+            if (listenerPlayer == null || speakerPlayer == null) {
+                return Spatial.CENTER;
+            }
+            Object listenerObject = listenerPlayer.getPlayer();
+            Object speakerObject = speakerPlayer.getPlayer();
+            if (!(listenerObject instanceof net.minecraft.world.entity.Entity listenerEntity)
+                    || !(speakerObject instanceof net.minecraft.world.entity.Entity speakerEntity)) {
+                return Spatial.CENTER;
+            }
+            net.minecraft.world.phys.Vec3 eye = listenerEntity.getEyePosition();
+            net.minecraft.world.phys.Vec3 look = listenerEntity.getLookAngle();
+            net.minecraft.world.phys.Vec3 relative = speakerEntity.getEyePosition().subtract(eye);
+            double distance = relative.length();
+            if (distance < 1.0E-5D) {
+                return Spatial.CENTER;
+            }
+            net.minecraft.world.phys.Vec3 flat = new net.minecraft.world.phys.Vec3(look.x, 0D,
+                    look.z);
+            if (flat.lengthSqr() < 1.0E-6D) {
+                return Spatial.CENTER;
+            }
+            net.minecraft.world.phys.Vec3 right = flat.normalize()
+                    .cross(new net.minecraft.world.phys.Vec3(0D, 1D, 0D));
+            net.minecraft.world.phys.Vec3 direction = relative.scale(1D / distance);
+            float pan = (float) Math.max(-1D, Math.min(1D, direction.dot(right)));
+            float elevation = (float) Math.max(-1D, Math.min(1D, direction.y));
+            return new Spatial(pan, elevation, relative.dot(look) < 0D);
+        } catch (RuntimeException e) {
+            return Spatial.CENTER;
+        }
     }
 
     /**

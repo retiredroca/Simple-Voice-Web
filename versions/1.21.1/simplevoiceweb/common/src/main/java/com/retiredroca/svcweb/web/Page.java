@@ -6,8 +6,8 @@ package com.retiredroca.svcweb.web;
  * <p>Self-contained: no CDN, no external script, no analytics. Audio is Opus over WebCodecs, which
  * the browser requires to run in a secure context - hence TLS.
  *
- * <p>Nothing here knows a player's coordinates. The server sends a per-speaker gain with each audio
- * frame, computed from positions that never leave the server.
+ * <p>Nothing here knows a player's coordinates or direction. The server sends one mixed stereo
+ * stream, encoded from positions that never leave the server.
  */
 public final class Page {
 
@@ -39,14 +39,13 @@ public final class Page {
   .volume-row output { min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
   #status { margin-top: 16px; font-size: 13px; color: #9aa3af; white-space: pre-wrap; }
   #people { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
-  .person { display: grid; grid-template-columns: minmax(0, 1fr) 88px 42px 42px;
+  .person { display: grid; grid-template-columns: minmax(0, 1fr) 88px 42px;
             gap: 8px; align-items: center; padding: 6px 10px;
             background: #22262e; border-radius: 6px; font-size: 13px; }
   .person .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .person input[type="range"] { width: 88px; accent-color: #3b82f6; }
   .person.speaking { background: #1e3a2f; }
   .volume { color: #9aa3af; font-variant-numeric: tabular-nums; text-align: right; }
-  .gain { color: #6b7280; font-variant-numeric: tabular-nums; text-align: right; }
   .error { color: #f87171; }
 </style>
 </head>
@@ -83,6 +82,10 @@ public final class Page {
   let socket = null;
   let context = null;
   let encoder = null;
+  let leftDecoder = null;
+  let rightDecoder = null;
+  let nextPlayTime = 0;
+  let rxTimestamp = 0;
   let stream = null;
   let worklet = null;
   // The key is in the path of the page that was opened; a live session token is kept for
@@ -136,14 +139,11 @@ public final class Page {
   let speakerVolumes = readSpeakerVolumes();
   let masterGain = null;
 
-  const gains = new Map();
   const names = new Map();
   const nodes = new Map();
-  // One Opus decoder per speaker. The codec is stateful, so sharing one decoder across
-  // interleaved speakers corrupts every stream.
-  const decoders = new Map();
-
-  const speakerVolume = (uuid) => (speakerVolumes[uuid] ?? 100) / 100;
+  // The server mixes every audible speaker into two mono Opus streams. The browser joins the
+  // decoded left and right frames into one stereo buffer.
+  const pending = new Map();
 
   const saveSpeakerVolumes = () => {
     writeStored(SPEAKER_VOLUMES_KEY, JSON.stringify(speakerVolumes));
@@ -158,22 +158,7 @@ public final class Page {
     muteOutputButton.textContent = speakersMuted ? "Unmute speakers" : "Mute speakers";
   };
 
-  const applySpeakerGain = (uuid) => {
-    const entry = decoders.get(uuid);
-    if (entry) {
-      entry.gainNode.gain.value = (gains.get(uuid) ?? 0) * speakerVolume(uuid);
-    }
-  };
-
   applyMasterVolume();
-
-  const uuidFrom = (view, offset) => {
-    const hi = view.getBigUint64(offset, false).toString(16).padStart(16, "0");
-    const lo = view.getBigUint64(offset + 8, false).toString(16).padStart(16, "0");
-    const hex = hi + lo;
-    return hex.slice(0,8)+"-"+hex.slice(8,12)+"-"+hex.slice(12,16)+"-"
-         + hex.slice(16,20)+"-"+hex.slice(20);
-  };
 
   const setStatus = (text, isError) => {
     statusLine.textContent = text;
@@ -200,11 +185,9 @@ public final class Page {
         volume.setAttribute("aria-label", "Speaker volume");
         const volumeText = document.createElement("span");
         volumeText.className = "volume";
-        const gain = document.createElement("span");
-        gain.className = "gain";
-        node.append(label, volume, volumeText, gain);
+        node.append(label, volume, volumeText);
         people.append(node);
-        nodes.set(uuid, { node, label, volume, volumeText, gain });
+        nodes.set(uuid, { node, label, volume, volumeText });
       }
       const entry = nodes.get(uuid);
       entry.label.textContent = name || uuid;
@@ -217,17 +200,23 @@ public final class Page {
         speakerVolumes[uuid] = value;
         saveSpeakerVolumes();
         entry.volumeText.textContent = value + "%";
-        applySpeakerGain(uuid);
+        send({ type: "volume", uuid, volume: value });
       };
-      const g = gains.get(uuid) ?? 0;
-      entry.gain.textContent = Math.round(g * 100) + "%";
-      entry.node.classList.toggle("speaking", g > 0 && Date.now() - (entry.last ?? 0) < 400);
+      entry.node.classList.toggle("speaking", Date.now() - (entry.last ?? 0) < 400);
     }
   };
+
+  setInterval(() => renderPeople(true), 200);
 
   const send = (message) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
+    }
+  };
+
+  const sendVolumes = () => {
+    for (const [uuid, value] of Object.entries(speakerVolumes)) {
+      send({ type: "volume", uuid, volume: value });
     }
   };
 
@@ -246,57 +235,73 @@ public final class Page {
     frame.close();
   };
 
-  const decoderFor = (uuid) => {
-    let entry = decoders.get(uuid);
-    if (entry) return entry;
-    const gainNode = context.createGain();
-    gainNode.connect(masterGain || context.destination);
-    const state = { nextTime: 0, timestamp: 0 };
+  const onDecoded = (channel, data) => {
+    try {
+      if (!context || sessionEnded) return;
+      const timestamp = data.timestamp;
+      const pcm = new Float32Array(data.numberOfFrames);
+      data.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
+      let pair = pending.get(timestamp);
+      if (!pair) {
+        pair = {};
+        pending.set(timestamp, pair);
+      }
+      pair[channel] = pcm;
+      if (pair.left && pair.right) {
+        pending.delete(timestamp);
+        playStereo(pair.left, pair.right);
+      }
+      const cutoff = timestamp - 2000000;
+      for (const key of pending.keys()) {
+        if (key < cutoff) pending.delete(key);
+      }
+    } catch (e) {
+      setStatus("Playback error: " + e.message, true);
+      console.error("svcweb playback", e);
+    } finally {
+      data.close();
+    }
+  };
+
+  const createDecoder = (channel) => {
     const decoder = new AudioDecoder({
-      output: (data) => {
-        try {
-          const pcm = new Float32Array(data.numberOfFrames);
-          data.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
-          const buffer = context.createBuffer(1, pcm.length, SAMPLE_RATE);
-          buffer.copyToChannel(pcm, 0);
-          const node = context.createBufferSource();
-          node.buffer = buffer;
-          node.connect(gainNode);
-          const at = Math.max(context.currentTime + 0.01, state.nextTime);
-          node.start(at);
-          state.nextTime = at + buffer.duration;
-        } catch (e) {
-          setStatus("Playback error: " + e.message, true);
-          console.error("svcweb playback", e);
-        } finally {
-          data.close();
-        }
-      },
+      output: (data) => onDecoded(channel, data),
       error: (e) => {
-        decoders.delete(uuid);
         setStatus("Decoder error: " + e.message, true);
         console.error("svcweb decoder", e);
       },
     });
     decoder.configure({ codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: 1 });
-    entry = { decoder, gainNode, state };
-    decoders.set(uuid, entry);
-    return entry;
+    return decoder;
   };
 
-  const play = (uuid, bytes, gain) => {
-    if (!context) return;
+  const playStereo = (left, right) => {
+    if (!context || !masterGain || sessionEnded) return;
+    const frames = Math.min(left.length, right.length);
+    if (frames === 0) return;
+    const buffer = context.createBuffer(2, frames, SAMPLE_RATE);
+    buffer.copyToChannel(left.subarray(0, frames), 0);
+    buffer.copyToChannel(right.subarray(0, frames), 1);
+    const node = context.createBufferSource();
+    node.buffer = buffer;
+    node.connect(masterGain);
+    const at = Math.max(context.currentTime + 0.04, nextPlayTime);
+    node.start(at);
+    nextPlayTime = at + buffer.duration;
+  };
+
+  const playPair = (left, right) => {
+    if (!context || !leftDecoder || !rightDecoder) return;
     if (context.state !== "running") context.resume().catch(() => {});
-    const entry = decoderFor(uuid);
-    gains.set(uuid, gain);
-    applySpeakerGain(uuid);
-    entry.state.timestamp += 20000;
-    entry.decoder.decode(new EncodedAudioChunk({
+    rxTimestamp += 20000;
+    const chunk = (data) => new EncodedAudioChunk({
       type: "key",
-      timestamp: entry.state.timestamp,
+      timestamp: rxTimestamp,
       duration: 20000,
-      data: bytes,
-    }));
+      data,
+    });
+    leftDecoder.decode(chunk(left));
+    rightDecoder.decode(chunk(right));
   };
 
   const connect = () => {
@@ -314,6 +319,7 @@ public final class Page {
     socket.onopen = () => {
       reconnectAttempts = 0;
       serverError = "";
+      sendVolumes();
       setStatus("Connected. Speak normally.");
     };
     socket.onclose = (event) => {
@@ -376,31 +382,28 @@ public final class Page {
             setStatus(serverError, true);
           } else {
             serverError = "";
+            sendVolumes();
             if (encoder) setStatus("Connected. Speak normally.");
           }
         } else if (message.type === "speaker") {
           names.set(message.uuid, message.name);
-          gains.set(message.uuid, message.gain ?? gains.get(message.uuid) ?? 0);
           const entry = nodes.get(message.uuid);
-          if (entry) entry.last = Date.now();
-          renderPeople();
+          if (entry) entry.last = message.speaking === false ? 0 : Date.now();
+          renderPeople(true);
         } else if (message.type === "error") {
           serverError = message.message;
           setStatus(serverError, true);
         }
       } else {
         const bytes = new Uint8Array(event.data);
-        if (bytes.length < 21 || bytes[0] !== 1) return;
+        if (bytes.length < 5 || bytes[0] !== 3) return;
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        const uuid = uuidFrom(view, 1);
-        const gain = view.getFloat32(17, false);
-        gains.set(uuid, gain);
-        const entry = nodes.get(uuid);
-        if (entry) entry.last = Date.now();
-        // Set the speaker icon before decoding; the decoder is async.
-        if (entry) entry.node.classList.add("speaking");
-        renderPeople();
-        play(uuid, bytes.subarray(21), gain);
+        const leftLength = view.getUint16(1, false);
+        const rightLength = view.getUint16(3, false);
+        if (leftLength === 0 || rightLength === 0
+            || bytes.length !== 5 + leftLength + rightLength) return;
+        playPair(bytes.subarray(5, 5 + leftLength),
+                 bytes.subarray(5 + leftLength));
       }
     };
   };
@@ -415,10 +418,17 @@ public final class Page {
       try { encoder.close(); } catch (e) {}
       encoder = null;
     }
-    for (const entry of decoders.values()) {
-      try { entry.decoder.close(); } catch (e) {}
+    if (leftDecoder) {
+      try { leftDecoder.close(); } catch (e) {}
+      leftDecoder = null;
     }
-    decoders.clear();
+    if (rightDecoder) {
+      try { rightDecoder.close(); } catch (e) {}
+      rightDecoder = null;
+    }
+    pending.clear();
+    nextPlayTime = 0;
+    rxTimestamp = 0;
     if (context) {
       context.close().catch(() => {});
       context = null;
@@ -446,6 +456,18 @@ public final class Page {
     masterGain = context.createGain();
     masterGain.connect(context.destination);
     applyMasterVolume();
+
+    const monoSupported = await AudioDecoder.isConfigSupported({
+      codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: 1,
+    });
+    if (!monoSupported.supported) {
+      throw new Error("This browser cannot decode Opus.");
+    }
+    leftDecoder = createDecoder("left");
+    rightDecoder = createDecoder("right");
+    pending.clear();
+    nextPlayTime = context.currentTime + 0.05;
+    rxTimestamp = 0;
 
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,

@@ -7,8 +7,8 @@ chat through a web page.
 A player runs `/svcweb link` in game and receives a keyed, single-use URL. Opening it on a phone,
 tablet or second machine gives them a microphone and speakers for their existing in-game character:
 other players hear them from their avatar, and they hear nearby players with the same distance
-falloff as a normal client. **No player position is ever sent to the browser** - the server computes
-a per-speaker gain from positions it already has.
+falloff as a normal client. **No player position or direction is ever sent to the browser** - the
+server mixes the audible speakers into stereo using positions it already has.
 
 ## Requirements
 
@@ -33,8 +33,9 @@ Two public Simple Voice Chat API primitives do the work:
   no voice chat connection at all.
 
 The web page captures the microphone, encodes Opus with WebCodecs, and sends 20 ms frames over a
-WebSocket. Incoming audio is decoded per speaker and played through Web Audio. The server sends a
-scalar gain with each packet, never a coordinate.
+WebSocket. Incoming audio is decoded on the server, mixed into one stereo stream using each
+speaker's position relative to the listener, and sent as paired mono Opus frames. The browser joins
+the left and right frames into stereo audio. No coordinates or direction data are sent.
 
 Because the bridge runs entirely on the Java server, Bedrock players who connect through **Geyser**
 use the same keyed browser link as Java players. They do not need a Bedrock voice mod.
@@ -154,9 +155,9 @@ travel in clear text.
 - The key is bound to the player it was issued to. If they leave the server, any open session is
   closed.
 - The web page contains no third-party scripts, fonts, analytics or CDNs.
-- **Positions stay on the server.** The browser receives a gain per audio packet and no coordinates,
-  so it cannot reconstruct anyone's location. There is consequently no stereo panning: proximity is
-  reproduced as loudness only.
+- **Positions stay on the server.** The browser receives only the mixed stereo audio, with no
+  coordinates, direction, gain or pan scalars. Spatial cues are applied on the server before the
+  mix, so the page cannot reconstruct anyone's location.
 
 ## Building
 
