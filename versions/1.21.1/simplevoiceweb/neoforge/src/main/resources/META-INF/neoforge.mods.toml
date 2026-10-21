@@ -7,8 +7,8 @@ modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
 description='''
-Join a server's Simple Voice Chat proximity voice from a browser. Players without the mod get a
-keyed, single-use link and speak through a web page.
+Browser proximity voice for Simple Voice Chat on Java servers, including Java + Bedrock servers via
+Geyser. Players without the mod get a keyed, single-use link and speak through a web page.
 '''
 
 [[dependencies.${mod_id}]]

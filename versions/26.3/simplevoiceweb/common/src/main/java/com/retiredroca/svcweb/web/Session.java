@@ -66,23 +66,34 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
             return;
         }
         socket = upgrade;
+        sessions.register(player, this);
+        if (closed) {
+            close();
+            return;
+        }
 
         SessionRegistry.Session session = sessions.create(player);
         String name = SimpleVoiceWeb.onServer(() -> SimpleVoiceWeb.platform().playerName(player));
         displayName = name == null ? player.toString() : name;
+
+        SimpleVoiceWeb.LOGGER.info("Web voice connection from {} for {}",
+                rawSocket.getRemoteSocketAddress(), player);
 
         // hello first: the page stores the session token from it, and the token is what lets the
         // tab reconnect without a new command.
         upgrade.sendText("{\"type\":\"hello\",\"uuid\":\"" + player + "\",\"name\":\""
                 + escape(displayName) + "\",\"session\":\"" + session.token() + "\"}");
 
-        boolean attached = audio.attach(player);
+        boolean attached = audio.subscribe(player, this);
+        upgrade.sendText("{\"type\":\"attached\",\"attached\":" + attached + "}");
         if (!attached) {
-            upgrade.sendText("{\"type\":\"error\",\"message\":\"Voice chat is not available yet. "
-                    + "Make sure Simple Voice Chat is installed and you do not have the mod.\"}");
+            SimpleVoiceWeb.LOGGER.warn("Web voice could not attach {}; the browser will have no audio",
+                    player);
+            upgrade.sendText("{\"type\":\"error\",\"message\":\"Voice chat could not attach this "
+                    + "player. Make sure Simple Voice Chat is running and this client does not have "
+                    + "the mod installed.\"}");
         }
 
-        audio.subscribe(player, this);
         startWriter();
 
         try {
@@ -194,8 +205,11 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
                         return;
                     }
                     if (outgoing == null) {
-                        // Keep proxies from closing an idle WebSocket. Browsers answer pings.
+                        // Keep proxies from closing an idle WebSocket. Browsers answer pings; the
+                        // text frame also gives proxies that ignore control frames something to
+                        // count as activity.
                         current.ping();
+                        current.sendText("{\"type\":\"keepalive\"}");
                         continue;
                     }
                     if (outgoing.text) {
@@ -215,8 +229,28 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
         writer = thread;
     }
 
+    /** Sends a final message, then closes with the player-left code. */
+    public void kick(String message) {
+        if (closed) {
+            return;
+        }
+        WebSocket current = socket;
+        if (current != null) {
+            try {
+                current.sendText("{\"type\":\"offline\",\"message\":\"" + escape(message) + "\"}");
+            } catch (Exception ignored) {
+                // The socket is going away; the close below is what matters.
+            }
+        }
+        close(4001, "Player left the game");
+    }
+
     @Override
     public void close() {
+        close(1000, "");
+    }
+
+    private void close(int code, String reason) {
         if (closed) {
             return;
         }
@@ -230,11 +264,13 @@ public final class Session implements AudioBridge.Sink, AutoCloseable {
         WebSocket current = socket;
         socket = null;
         if (current != null) {
-            current.close();
+            current.close(code, reason);
         }
         UUID owner = player;
         if (owner != null) {
-            audio.unsubscribe(owner);
+            SimpleVoiceWeb.LOGGER.info("Web voice disconnected: {}", owner);
+            sessions.unregister(owner, this);
+            audio.unsubscribe(owner, this);
         }
     }
 

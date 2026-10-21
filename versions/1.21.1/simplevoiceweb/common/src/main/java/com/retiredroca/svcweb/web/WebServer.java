@@ -145,6 +145,7 @@ public final class WebServer {
     }
 
     private void serve(Socket socket) {
+        boolean websocket = false;
         try (socket) {
             socket.setSoTimeout(30_000);
             InputStream in = new BufferedInputStream(socket.getInputStream());
@@ -180,6 +181,7 @@ public final class WebServer {
             }
 
             if (path.equals("/ws")) {
+                websocket = true;
                 socket.setSoTimeout(0);
                 connectionHandler.handle(socket, in, out, head, query);
                 return;
@@ -206,7 +208,12 @@ public final class WebServer {
         } catch (java.net.SocketTimeoutException e) {
             // A browser that opened a connection and said nothing.
         } catch (Exception e) {
-            SimpleVoiceWeb.LOGGER.debug("Web request failed: {}", e.getMessage());
+            if (websocket) {
+                SimpleVoiceWeb.LOGGER.warn("WebSocket session from "
+                        + socket.getRemoteSocketAddress() + " failed", e);
+            } else {
+                SimpleVoiceWeb.LOGGER.debug("Web request failed: {}", e.getMessage());
+            }
         } finally {
             sockets.remove(socket);
         }

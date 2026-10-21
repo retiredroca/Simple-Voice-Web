@@ -1,7 +1,8 @@
 # Simple Voice Web
 
-A server-side Fabric/NeoForge mod that lets players **without** the Simple Voice Chat mod join a
-server's proximity voice chat through a web page.
+A server-side Fabric/NeoForge mod for **Java Edition servers, including Java + Bedrock servers using
+Geyser**, that lets players **without** the Simple Voice Chat mod join the server's proximity voice
+chat through a web page.
 
 A player runs `/svcweb link` in game and receives a keyed, single-use URL. Opening it on a phone,
 tablet or second machine gives them a microphone and speakers for their existing in-game character:
@@ -11,7 +12,8 @@ a per-speaker gain from positions it already has.
 
 ## Requirements
 
-- Minecraft Java Edition **1.21.1 or 26.3** server, Fabric or NeoForge.
+- A Minecraft **Java Edition** server (`1.21.1` or `26.3`, Fabric or NeoForge). Bedrock clients can
+  join through **Geyser**; no Bedrock-side mod is needed to use the web link.
 - [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat) **2.6.0 or newer** on the server
   (the 26.3 build requires **2.6.24**, the SVC version for that Minecraft release).
 - A modern browser with WebCodecs audio over **HTTPS** (or `http://localhost`): current Chrome,
@@ -34,6 +36,9 @@ The web page captures the microphone, encodes Opus with WebCodecs, and sends 20 
 WebSocket. Incoming audio is decoded per speaker and played through Web Audio. The server sends a
 scalar gain with each packet, never a coordinate.
 
+Because the bridge runs entirely on the Java server, Bedrock players who connect through **Geyser**
+use the same keyed browser link as Java players. They do not need a Bedrock voice mod.
+
 ## Commands
 
 All commands run on the server; the player must be in game to receive a link.
@@ -52,42 +57,43 @@ network drop reconnects without a new command.
 
 ## Configuration
 
-`config/simplevoiceweb.properties` is written with defaults on first start. The important settings:
+`config/simplevoiceweb.properties` is written with defaults on first start. The default is
+reverse-proxy mode: `tls_mode=off`, bound to `127.0.0.1`.
+
+**Reverse proxy (recommended):**
+
+```properties
+enabled=true
+bind_address=127.0.0.1
+port=8080
+public_url=https://voice.example.com
+redirect_url=https://github.com/retiredroca/Simple-Voice-Web
+tls_mode=off
+audio_proximity=true
+audio_groups=true
+```
+
+**Built-in ACME + DuckDNS:**
 
 ```properties
 enabled=true
 bind_address=0.0.0.0
 port=8080
-# The external address players reach. Required, and must be https:// unless tls_mode=off.
-public_url=https://voice.example.com
-# Where "/" redirects. The mod never serves anything at the root.
+public_url=https://voice.example.duckdns.org
 redirect_url=https://github.com/retiredroca/Simple-Voice-Web
-
-link_ttl_seconds=600
-session_ttl_minutes=720
-max_links_per_player=3
-command_requires_op=false
-
-# acme | manual | off
 tls_mode=acme
-
-# tls_mode=manual
-tls_certificate_file=certs/fullchain.pem
-tls_private_key_file=certs/privkey.pem
-
-# tls_mode=acme (built-in Let's Encrypt via DNS-01 + DuckDNS)
 acme_email=you@example.com
 acme_domain=voice.example.duckdns.org
 duckdns_subdomain=voice.example
 duckdns_token=your-duckdns-token
-acme_directory=https://acme-v02.api.letsencrypt.org/directory
-acme_renew_days=30
-acme_staging=false
-dns_resolver=
-
 audio_proximity=true
 audio_groups=true
 ```
+
+The generated file has separate sections for the web listener/links, reverse proxy, ACME + DuckDNS,
+manual certificates, and audio. Only the section selected by `tls_mode` is used. The file is not
+rewritten on every start; when an update changes the config layout or keys, it is migrated once and
+the previous file is kept as `simplevoiceweb.properties.bak`.
 
 ### TLS modes
 

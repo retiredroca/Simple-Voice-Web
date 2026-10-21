@@ -2,7 +2,9 @@ package com.retiredroca.svcweb.web;
 
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -21,6 +23,7 @@ public final class SessionRegistry {
     private static final Base64.Encoder ENCODER = Base64.getUrlEncoder().withoutPadding();
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+    private final Map<UUID, Set<com.retiredroca.svcweb.web.Session>> live = new ConcurrentHashMap<>();
     private final long ttlMillis;
 
     public SessionRegistry(long ttlMillis) {
@@ -58,6 +61,36 @@ public final class SessionRegistry {
 
     public synchronized void remove(String token) {
         sessions.remove(token);
+    }
+
+    /** Registers a live WebSocket session so a player logout can close it. */
+    public void register(UUID player, com.retiredroca.svcweb.web.Session session) {
+        live.computeIfAbsent(player, id -> ConcurrentHashMap.newKeySet()).add(session);
+    }
+
+    public void unregister(UUID player, com.retiredroca.svcweb.web.Session session) {
+        Set<com.retiredroca.svcweb.web.Session> set = live.get(player);
+        if (set == null) {
+            return;
+        }
+        set.remove(session);
+        if (set.isEmpty()) {
+            live.remove(player, set);
+        }
+    }
+
+    /**
+     * Closes every live WebSocket for a player. The set is removed before closing so a session's
+     * own close path cannot deadlock on this registry.
+     */
+    public void closeAll(UUID player, String message) {
+        Set<com.retiredroca.svcweb.web.Session> set = live.remove(player);
+        if (set == null) {
+            return;
+        }
+        for (com.retiredroca.svcweb.web.Session session : List.copyOf(set)) {
+            session.kick(message);
+        }
     }
 
     /** Drops every session for a player, used when they disconnect. */

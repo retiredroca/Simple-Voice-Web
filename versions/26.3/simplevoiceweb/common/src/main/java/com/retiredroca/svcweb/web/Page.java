@@ -32,12 +32,21 @@ public final class Page {
   button { font: inherit; padding: 10px 16px; border: 0; border-radius: 8px; cursor: pointer;
            background: #3b82f6; color: #fff; }
   button:disabled { background: #2a2f3a; color: #6b7280; cursor: default; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .volume-row { display: flex; gap: 8px; align-items: center; margin-top: 12px;
+                font-size: 13px; color: #9aa3af; }
+  .volume-row input { width: 140px; accent-color: #3b82f6; }
+  .volume-row output { min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
   #status { margin-top: 16px; font-size: 13px; color: #9aa3af; white-space: pre-wrap; }
   #people { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
-  .person { display: flex; justify-content: space-between; padding: 6px 10px;
+  .person { display: grid; grid-template-columns: minmax(0, 1fr) 88px 42px 42px;
+            gap: 8px; align-items: center; padding: 6px 10px;
             background: #22262e; border-radius: 6px; font-size: 13px; }
+  .person .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person input[type="range"] { width: 88px; accent-color: #3b82f6; }
   .person.speaking { background: #1e3a2f; }
-  .gain { color: #6b7280; font-variant-numeric: tabular-nums; }
+  .volume { color: #9aa3af; font-variant-numeric: tabular-nums; text-align: right; }
+  .gain { color: #6b7280; font-variant-numeric: tabular-nums; text-align: right; }
   .error { color: #f87171; }
 </style>
 </head>
@@ -45,8 +54,16 @@ public final class Page {
 <main>
   <h1>%TITLE%</h1>
   <p>Proximity voice, in the browser. Your position stays on the server.</p>
-  <button id="start">Join voice</button>
-  <button id="mute" disabled>Mute</button>
+  <div class="controls">
+    <button id="start">Join voice</button>
+    <button id="mute" disabled>Mute mic</button>
+    <button id="muteOutput" disabled>Mute speakers</button>
+  </div>
+  <div class="volume-row">
+    <label for="volume">Volume</label>
+    <input id="volume" type="range" min="0" max="150" step="5" value="50">
+    <output id="volumeValue">50%</output>
+  </div>
   <div id="status">Not connected.</div>
   <div id="people"></div>
 </main>
@@ -57,6 +74,9 @@ public final class Page {
   const FRAME = 960;
   const startButton = document.getElementById("start");
   const muteButton = document.getElementById("mute");
+  const muteOutputButton = document.getElementById("muteOutput");
+  const volumeInput = document.getElementById("volume");
+  const volumeValue = document.getElementById("volumeValue");
   const statusLine = document.getElementById("status");
   const people = document.getElementById("people");
 
@@ -73,12 +93,79 @@ public final class Page {
   let sessionToken = sessionStorage.getItem("svcweb-session") || "";
   let muted = false;
   let reconnectAttempts = 0;
+  let txTimestamp = 0;
+  let serverError = "";
+  let offlineReason = "";
+  let sessionEnded = false;
+  let selfUuid = "";
+
+  const MASTER_VOLUME_KEY = "svcweb-master-volume";
+  const SPEAKER_VOLUMES_KEY = "svcweb-speaker-volumes";
+  const SPEAKERS_MUTED_KEY = "svcweb-speakers-muted";
+
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+  const readStored = (key) => {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  };
+  const writeStored = (key, value) => {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  };
+  const readStoredNumber = (key, fallback, min, max) => {
+    const raw = readStored(key);
+    if (raw === null || raw === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? clamp(value, min, max) : fallback;
+  };
+  const readSpeakerVolumes = () => {
+    try {
+      const value = JSON.parse(readStored(SPEAKER_VOLUMES_KEY) || "{}");
+      if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+      const out = {};
+      for (const [uuid, volume] of Object.entries(value)) {
+        const n = Number(volume);
+        if (Number.isFinite(n)) out[uuid] = clamp(n, 0, 200);
+      }
+      return out;
+    } catch (e) {
+      return {};
+    }
+  };
+
+  let masterVolume = readStoredNumber(MASTER_VOLUME_KEY, 50, 0, 150);
+  let speakersMuted = readStored(SPEAKERS_MUTED_KEY) === "true";
+  let speakerVolumes = readSpeakerVolumes();
+  let masterGain = null;
+
   const gains = new Map();
   const names = new Map();
   const nodes = new Map();
   // One Opus decoder per speaker. The codec is stateful, so sharing one decoder across
   // interleaved speakers corrupts every stream.
   const decoders = new Map();
+
+  const speakerVolume = (uuid) => (speakerVolumes[uuid] ?? 100) / 100;
+
+  const saveSpeakerVolumes = () => {
+    writeStored(SPEAKER_VOLUMES_KEY, JSON.stringify(speakerVolumes));
+  };
+
+  const applyMasterVolume = () => {
+    if (masterGain) {
+      masterGain.gain.value = speakersMuted ? 0 : masterVolume / 100;
+    }
+    volumeInput.value = String(masterVolume);
+    volumeValue.textContent = speakersMuted ? "Muted" : masterVolume + "%";
+    muteOutputButton.textContent = speakersMuted ? "Unmute speakers" : "Mute speakers";
+  };
+
+  const applySpeakerGain = (uuid) => {
+    const entry = decoders.get(uuid);
+    if (entry) {
+      entry.gainNode.gain.value = (gains.get(uuid) ?? 0) * speakerVolume(uuid);
+    }
+  };
+
+  applyMasterVolume();
 
   const uuidFrom = (view, offset) => {
     const hi = view.getBigUint64(offset, false).toString(16).padStart(16, "0");
@@ -104,14 +191,34 @@ public final class Page {
         node = document.createElement("div");
         node.className = "person";
         const label = document.createElement("span");
+        label.className = "name";
+        const volume = document.createElement("input");
+        volume.type = "range";
+        volume.min = "0";
+        volume.max = "200";
+        volume.step = "5";
+        volume.setAttribute("aria-label", "Speaker volume");
+        const volumeText = document.createElement("span");
+        volumeText.className = "volume";
         const gain = document.createElement("span");
         gain.className = "gain";
-        node.append(label, gain);
+        node.append(label, volume, volumeText, gain);
         people.append(node);
-        nodes.set(uuid, { node, label, gain });
+        nodes.set(uuid, { node, label, volume, volumeText, gain });
       }
       const entry = nodes.get(uuid);
       entry.label.textContent = name || uuid;
+      const userVolume = speakerVolumes[uuid] ?? 100;
+      if (document.activeElement !== entry.volume) entry.volume.value = String(userVolume);
+      entry.volume.disabled = uuid === selfUuid;
+      entry.volumeText.textContent = uuid === selfUuid ? "self" : userVolume + "%";
+      entry.volume.oninput = () => {
+        const value = clamp(Number(entry.volume.value) || 0, 0, 200);
+        speakerVolumes[uuid] = value;
+        saveSpeakerVolumes();
+        entry.volumeText.textContent = value + "%";
+        applySpeakerGain(uuid);
+      };
       const g = gains.get(uuid) ?? 0;
       entry.gain.textContent = Math.round(g * 100) + "%";
       entry.node.classList.toggle("speaking", g > 0 && Date.now() - (entry.last ?? 0) < 400);
@@ -131,9 +238,10 @@ public final class Page {
       sampleRate: SAMPLE_RATE,
       numberOfFrames: FRAME,
       numberOfChannels: 1,
-      timestamp: Math.round(performance.now() * 1000),
+      timestamp: txTimestamp,
       data: pcm,
     });
+    txTimestamp += 20000;
     encoder.encode(frame);
     frame.close();
   };
@@ -142,40 +250,60 @@ public final class Page {
     let entry = decoders.get(uuid);
     if (entry) return entry;
     const gainNode = context.createGain();
-    gainNode.connect(context.destination);
+    gainNode.connect(masterGain || context.destination);
+    const state = { nextTime: 0, timestamp: 0 };
     const decoder = new AudioDecoder({
       output: (data) => {
-        const pcm = new Float32Array(data.numberOfFrames);
-        data.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
-        const buffer = context.createBuffer(1, pcm.length, SAMPLE_RATE);
-        buffer.copyToChannel(pcm, 0);
-        const node = context.createBufferSource();
-        node.buffer = buffer;
-        node.connect(gainNode);
-        node.start();
-        data.close();
+        try {
+          const pcm = new Float32Array(data.numberOfFrames);
+          data.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
+          const buffer = context.createBuffer(1, pcm.length, SAMPLE_RATE);
+          buffer.copyToChannel(pcm, 0);
+          const node = context.createBufferSource();
+          node.buffer = buffer;
+          node.connect(gainNode);
+          const at = Math.max(context.currentTime + 0.01, state.nextTime);
+          node.start(at);
+          state.nextTime = at + buffer.duration;
+        } catch (e) {
+          setStatus("Playback error: " + e.message, true);
+          console.error("svcweb playback", e);
+        } finally {
+          data.close();
+        }
       },
-      error: (e) => setStatus("Decoder error: " + e.message, true),
+      error: (e) => {
+        decoders.delete(uuid);
+        setStatus("Decoder error: " + e.message, true);
+        console.error("svcweb decoder", e);
+      },
     });
     decoder.configure({ codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: 1 });
-    entry = { decoder, gainNode };
+    entry = { decoder, gainNode, state };
     decoders.set(uuid, entry);
     return entry;
   };
 
   const play = (uuid, bytes, gain) => {
     if (!context) return;
+    if (context.state !== "running") context.resume().catch(() => {});
     const entry = decoderFor(uuid);
-    entry.gainNode.gain.value = gain;
+    gains.set(uuid, gain);
+    applySpeakerGain(uuid);
+    entry.state.timestamp += 20000;
     entry.decoder.decode(new EncodedAudioChunk({
       type: "key",
-      timestamp: Math.round(performance.now() * 1000),
+      timestamp: entry.state.timestamp,
       duration: 20000,
       data: bytes,
     }));
   };
 
   const connect = () => {
+    if (socket && (socket.readyState === WebSocket.CONNECTING
+                   || socket.readyState === WebSocket.OPEN)) {
+      return;
+    }
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const query = sessionToken
       ? "?session=" + encodeURIComponent(sessionToken)
@@ -185,9 +313,20 @@ public final class Page {
 
     socket.onopen = () => {
       reconnectAttempts = 0;
+      serverError = "";
       setStatus("Connected. Speak normally.");
     };
     socket.onclose = (event) => {
+      console.warn("svcweb socket closed", event.code, event.reason);
+      if (offlineReason || event.code === 4001) {
+        sessionToken = "";
+        sessionStorage.removeItem("svcweb-session");
+        stopAudio();
+        startButton.disabled = true;
+        startButton.textContent = "Session ended";
+        setStatus(offlineReason || "You left the game. Rejoin and run /svcweb link again.", true);
+        return;
+      }
       // A refused upgrade (expired or already-used link) arrives as 1006, because the browser
       // never saw a WebSocket-level close. Only retry when a live session token can be used:
       // the link key itself is single-use and would fail again.
@@ -195,6 +334,9 @@ public final class Page {
       if (expired || reconnectAttempts >= 3) {
         sessionStorage.removeItem("svcweb-session");
         sessionToken = "";
+        stopAudio();
+        startButton.disabled = true;
+        startButton.textContent = "Session ended";
         setStatus("This link has expired or the connection was lost. Run /svcweb link in game "
                   + "for a new one.", true);
         return;
@@ -203,7 +345,10 @@ public final class Page {
       setStatus("Disconnected. Reconnecting...");
       setTimeout(connect, 2000);
     };
-    socket.onerror = () => setStatus("Connection error.", true);
+    socket.onerror = () => {
+      console.warn("svcweb socket error");
+      setStatus("Connection error.", true);
+    };
 
     socket.onmessage = (event) => {
       if (typeof event.data === "string") {
@@ -213,8 +358,26 @@ public final class Page {
             sessionToken = message.session;
             sessionStorage.setItem("svcweb-session", sessionToken);
           }
+          selfUuid = message.uuid;
           names.set(message.uuid, message.name);
           renderPeople(true);
+        } else if (message.type === "offline") {
+          offlineReason = message.message || "You left the game. Rejoin and run /svcweb link again.";
+          sessionToken = "";
+          sessionStorage.removeItem("svcweb-session");
+          stopAudio();
+          startButton.disabled = true;
+          startButton.textContent = "Session ended";
+          setStatus(offlineReason, true);
+        } else if (message.type === "attached") {
+          if (message.attached === false) {
+            serverError = "Voice chat could not attach this player. Make sure Simple Voice Chat is "
+                        + "running and this client does not have the mod installed.";
+            setStatus(serverError, true);
+          } else {
+            serverError = "";
+            if (encoder) setStatus("Connected. Speak normally.");
+          }
         } else if (message.type === "speaker") {
           names.set(message.uuid, message.name);
           gains.set(message.uuid, message.gain ?? gains.get(message.uuid) ?? 0);
@@ -222,7 +385,8 @@ public final class Page {
           if (entry) entry.last = Date.now();
           renderPeople();
         } else if (message.type === "error") {
-          setStatus(message.message, true);
+          serverError = message.message;
+          setStatus(serverError, true);
         }
       } else {
         const bytes = new Uint8Array(event.data);
@@ -241,13 +405,62 @@ public final class Page {
     };
   };
 
+  const stopAudio = () => {
+    sessionEnded = true;
+    if (stream) {
+      for (const track of stream.getTracks()) track.stop();
+      stream = null;
+    }
+    if (encoder) {
+      try { encoder.close(); } catch (e) {}
+      encoder = null;
+    }
+    for (const entry of decoders.values()) {
+      try { entry.decoder.close(); } catch (e) {}
+    }
+    decoders.clear();
+    if (context) {
+      context.close().catch(() => {});
+      context = null;
+    }
+    masterGain = null;
+    worklet = null;
+    muteButton.disabled = true;
+    muteOutputButton.disabled = true;
+    muteButton.textContent = "Mute mic";
+    muted = false;
+  };
+
   const startAudio = async () => {
+    sessionEnded = false;
+    context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+    await context.resume();
+    if (context.state !== "running") {
+      throw new Error("The browser blocked audio output. Click Join voice again or check autoplay "
+                    + "settings.");
+    }
+    context.onstatechange = () => {
+      console.debug("svcweb audio context", context.state);
+      if (context.state === "suspended") context.resume().catch(() => {});
+    };
+    masterGain = context.createGain();
+    masterGain.connect(context.destination);
+    applyMasterVolume();
+
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
                autoGainControl: true, sampleRate: SAMPLE_RATE },
     });
+    if (sessionEnded) {
+      stopAudio();
+      return;
+    }
 
-    context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+    if (context.state !== "running") await context.resume();
+    if (context.state !== "running") {
+      throw new Error("The browser blocked audio input. Click Join voice again or check autoplay "
+                    + "settings.");
+    }
     await context.audioWorklet.addModule(URL.createObjectURL(new Blob([`
       class Capture extends AudioWorkletProcessor {
         constructor() {
@@ -272,9 +485,19 @@ public final class Page {
       registerProcessor("capture", Capture);
     `], { type: "application/javascript" })));
 
+    if (sessionEnded) {
+      stopAudio();
+      return;
+    }
     worklet = new AudioWorkletNode(context, "capture");
     const source = context.createMediaStreamSource(stream);
+    // The worklet only runs while something pulls it. Route it through a silent gain node so the
+    // microphone is processed without echoing it into the page.
+    const silent = context.createGain();
+    silent.gain.value = 0;
+    silent.connect(context.destination);
     source.connect(worklet);
+    worklet.connect(silent);
 
     const supported = await AudioEncoder.isConfigSupported({
       codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: 1, bitrate: 32000,
@@ -296,18 +519,36 @@ public final class Page {
     encoder.configure({ codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: 1,
                         bitrate: 32000 });
 
-
+    if (sessionEnded) {
+      stopAudio();
+      return;
+    }
     worklet.port.onmessage = (event) => encode(event.data);
 
     startButton.disabled = true;
-    startButton.textContent = "In voice";
+    startButton.textContent = serverError ? "Mic on (not connected)" : "In voice";
     muteButton.disabled = false;
-    setStatus("Connected. Speak normally.");
+    muteOutputButton.disabled = false;
+    if (!serverError && !sessionEnded) setStatus("Connected. Speak normally.");
+  };
+
+  volumeInput.oninput = () => {
+    masterVolume = clamp(Number(volumeInput.value) || 0, 0, 150);
+    speakersMuted = false;
+    writeStored(MASTER_VOLUME_KEY, String(masterVolume));
+    writeStored(SPEAKERS_MUTED_KEY, "false");
+    applyMasterVolume();
+  };
+
+  muteOutputButton.onclick = () => {
+    speakersMuted = !speakersMuted;
+    writeStored(SPEAKERS_MUTED_KEY, String(speakersMuted));
+    applyMasterVolume();
   };
 
   muteButton.onclick = () => {
     muted = !muted;
-    muteButton.textContent = muted ? "Unmute" : "Mute";
+    muteButton.textContent = muted ? "Unmute mic" : "Mute mic";
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: muted ? "mute" : "end" }));
     }
@@ -319,8 +560,10 @@ public final class Page {
       connect();
       await startAudio();
     } catch (e) {
-      setStatus("Could not start audio: " + e.message, true);
-      startButton.disabled = false;
+      if (!sessionEnded) {
+        setStatus("Could not start audio: " + e.message, true);
+        startButton.disabled = false;
+      }
     }
   };
 

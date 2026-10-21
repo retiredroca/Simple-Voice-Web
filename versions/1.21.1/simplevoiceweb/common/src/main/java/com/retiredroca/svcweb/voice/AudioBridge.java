@@ -121,10 +121,13 @@ public final class AudioBridge {
     private synchronized boolean attachOnServer(UUID player) {
         VoicechatServerApi serverApi = api;
         if (serverApi == null) {
+            SimpleVoiceWeb.LOGGER.warn("Voice chat API is not ready for {}; cannot attach", player);
             return false;
         }
         VoicechatConnection connection = serverApi.getConnectionOf(player);
         if (connection == null) {
+            SimpleVoiceWeb.LOGGER.warn("No voice chat connection or player state for {}; cannot attach",
+                    player);
             return false;
         }
         if (connection.isInstalled()) {
@@ -163,6 +166,7 @@ public final class AudioBridge {
 
         // SVC defaults a mod-less player to "disconnected"; the browser is their connection.
         connection.setConnected(true);
+        SimpleVoiceWeb.LOGGER.info("Attached {} to voice chat for web audio", player);
         return true;
     }
 
@@ -194,18 +198,34 @@ public final class AudioBridge {
         }
     }
 
-    /** Starts delivering to a sink; attaches the player to voice chat if that has not happened. */
-    public void subscribe(UUID player, Sink sink) {
+    /**
+     * Starts delivering to a sink and attaches the player if needed.
+     *
+     * @return true when voice chat is ready for this player
+     */
+    public boolean subscribe(UUID player, Sink sink) {
         sinks.put(player, sink);
         try {
-            attach(player);
+            return attach(player);
         } catch (RuntimeException e) {
             SimpleVoiceWeb.LOGGER.warn("Could not attach {} to voice chat: {}", player,
                     e.getMessage());
+            return false;
         }
     }
 
-    public void unsubscribe(UUID player) {
+    /**
+     * Removes a sink only if it is still the current one. A reconnect can replace the sink before
+     * the old connection closes; the old close must not detach the new connection's audio.
+     */
+    public void unsubscribe(UUID player, Sink sink) {
+        if (sinks.remove(player, sink)) {
+            detach(player);
+        }
+    }
+
+    /** Removes every sink for a player and detaches them, used when the player leaves the game. */
+    public void revoke(UUID player) {
         sinks.remove(player);
         detach(player);
     }

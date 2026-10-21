@@ -92,8 +92,10 @@ public final class VoiceWebService {
             if (stopping || Thread.currentThread().isInterrupted()) {
                 return;
             }
-            Session session = new Session(links, sessions, audio);
-            WebServer created = new WebServer(config, links, session::handle);
+            WebServer created = new WebServer(config, links,
+                    (socket, in, out, requestHead, query) ->
+                            new Session(links, sessions, audio)
+                                    .handle(socket, in, out, requestHead, query));
             created.start(tls, certificates.privateKey(), certificates.chain());
             server = created;
             status = "listening on " + config.bindAddress + ":" + created.port()
@@ -176,7 +178,8 @@ public final class VoiceWebService {
     public void revoke(UUID player) {
         links.revoke(player);
         sessions.revoke(player);
-        audio.unsubscribe(player);
+        sessions.closeAll(player, "You left the game. Rejoin and run /svcweb link again.");
+        audio.revoke(player);
     }
 
     /** Creates the service from the server's config directory. */
