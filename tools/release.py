@@ -48,14 +48,14 @@ def die(msg):
     sys.exit(f"release: error: {msg}")
 
 
-# A release jar is [<abbrev>-]<id>-<version>-<kind>.jar, matching jarFileName in
+# A release jar is [<abbrev>-]<id>-<version>-<kind>-<mc>.jar, matching jarFileName in
 # gradle/versions.gradle. Matching the shape rather than a list of ids means a new module needs no
 # edit here, and it rejects every pre-rename shape (a leading loader, or a dot before the version),
 # which a count check cannot. The id group allows dashes so an abbrev or a `bundle-` prefix matches.
-# A sources jar is the same shape with `-sources` after its loader. That suffix exists only in the
-# release: both builds name their sources jar <id>-<version>-sources.jar, because that is what a
+# A sources jar is [<abbrev>-]<id>-<version>-<loader>-sources-<mc>.jar. That suffix exists only in
+# the release: both builds name their sources jar <id>-<version>-sources.jar, because that is what a
 # maven consumer looks for, and the release renames them so the two do not collide side by side.
-ALLOWED_JAR = re.compile(r"^[A-Za-z0-9_-]+-[0-9][0-9.]*-(fabric|neoforge|universal)(-sources)?\.jar$")
+ALLOWED_JAR = re.compile(r"^[A-Za-z0-9_-]+-[0-9][0-9.]*-(fabric|neoforge|universal)(-sources)?-[0-9][0-9.]*\.jar$")
 
 
 # --- process helpers ----------------------------------------------------------------
@@ -119,10 +119,10 @@ def set_prop(text, key, value):
 ABBREV = (read_props(VERSIONS).get("abbrev") or "").strip()
 
 
-def release_jar(name, version, kind):
-    """Release jar name: [<abbrev>-]<id>-<version>-<kind>.jar, matching jarFileName in gradle/versions.gradle."""
+def release_jar(name, version, kind, mc):
+    """Release jar name: [<abbrev>-]<id>-<version>-<kind>-<mc>.jar, matching jarFileName."""
     prefix = f"{ABBREV}-" if ABBREV else ""
-    return f"{prefix}{name}-{version}-{kind}.jar"
+    return f"{prefix}{name}-{version}-{kind}-{mc}.jar"
 
 
 def module_ids(mc):
@@ -292,7 +292,7 @@ def verify(mc, dry):
     # scheme would be copied into dist/<mc>/ and published. Check the shape too.
     bad = [j for j in jars if not ALLOWED_JAR.match(j)]
     if bad:
-        die(f"unexpected files in dist/{mc}/ (not [<abbrev>-]<id>-<version>-<kind>.jar): {bad}")
+        die(f"unexpected files in dist/{mc}/ (not [<abbrev>-]<id>-<version>-<kind>-<mc>.jar): {bad}")
     log(f"release jar set OK ({len(jars)} files)")
 
 
@@ -693,7 +693,7 @@ def cf_publish(token, project_id, mc, changed, versions, dry):
     for name, is_changed in changed.items():
         if not is_changed:
             continue
-        jar = dist_dir(mc) / release_jar(name, versions[name], "universal")
+        jar = dist_dir(mc) / release_jar(name, versions[name], "universal", mc)
         if not jar.exists():
             log(f"skip CurseForge: {jar.name} not in dist/{mc}/")
             continue
@@ -701,7 +701,7 @@ def cf_publish(token, project_id, mc, changed, versions, dry):
         metadata = {
             "changelog": changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else "",
             "changelogType": "markdown",
-            "displayName": f"{name} {versions[name]}",
+            "displayName": f"{name} {versions[name]}-{mc}",
             "gameVersions": [mc, java_versions, default_loader],
             "releaseType": "release",
         }
@@ -736,11 +736,11 @@ def modrinth_sync(token, project, mc, changed, versions, dry):
     for name, is_changed in changed.items():
         if not is_changed:
             continue
-        jar = dist_dir(mc) / release_jar(name, versions[name], "universal")
+        jar = dist_dir(mc) / release_jar(name, versions[name], "universal", mc)
         if not jar.exists():
             log(f"skip Modrinth: {jar.name} not in dist/{mc}/")
             continue
-        version_number = versions[name]
+        version_number = f"{versions[name]}-{mc}"
         if dry:
             print(f"  [dry-run] Modrinth create version {name} {version_number}")
             continue

@@ -174,8 +174,8 @@ Both versions use the same sources. 26.3 is the deobfuscated generation and buil
 `net.fabricmc.fabric-loom` plugin for Fabric and ModDevGradle for NeoForge; 1.21.1 uses Loom 1.9.2
 and NeoGradle. Each `-Pmc` writes its own release set under `build/release/<mc>/`:
 
-- `*-fabric.jar` and `*-neoforge.jar` - per-loader.
-- `*-universal.jar` - one jar for both loaders.
+- `*-fabric-<mc>.jar` and `*-neoforge-<mc>.jar` - per-loader.
+- `*-universal-<mc>.jar` - one jar for both loaders.
 
 Use the universal jar unless your server setup requires a loader-specific one.
 

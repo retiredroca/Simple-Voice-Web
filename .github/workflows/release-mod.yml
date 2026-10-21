@@ -84,7 +84,7 @@ jobs:
           import release
           print(release.expected_jars('${MC_VERSION}'))
           ")
-          allowed='^[A-Za-z0-9_-]+-[0-9][0-9.]*-(fabric|neoforge|universal)(-sources)?\.jar$'
+          allowed='^[A-Za-z0-9_-]+-[0-9][0-9.]*-(fabric|neoforge|universal)(-sources)?-[0-9][0-9.]*\.jar$'
           bad=$(ls -1 "dist/${MC_VERSION}" | grep -vE "$allowed" || true)
           if [ -n "$bad" ]; then
             echo "Unexpected file(s) in dist/${MC_VERSION}/ (refusing to publish):" >&2
@@ -172,10 +172,10 @@ jobs:
         with:
           curseforge-id: ${{ vars.CURSEFORGE_ID }}
           curseforge-token: ${{ secrets.CURSEFORGE_API_KEY }}
-          curseforge-files: dist/${{ env.MC_VERSION }}/${{ env.ABBREV_PREFIX }}${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}-universal.jar
+          curseforge-files: dist/${{ env.MC_VERSION }}/${{ env.ABBREV_PREFIX }}${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}-universal-${{ env.MC_VERSION }}.jar
           curseforge-dependencies: fabric-api(required){modrinth:P7dR8mSH}{curseforge:306612}
-          name: ${{ env.PRIMARY }} ${{ env.PRIMARY_VERSION }}
-          version: ${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}
+          name: ${{ env.PRIMARY }} ${{ env.PRIMARY_VERSION }}-${{ env.MC_VERSION }}
+          version: ${{ env.PRIMARY }}-${{ env.PRIMARY_VERSION }}-${{ env.MC_VERSION }}
           changelog-file: dist/${{ env.MC_VERSION }}/changelog.md
           version-type: release
           game-versions: ${{ env.MC_VERSION }}
@@ -199,8 +199,8 @@ jobs:
           A="${ABBREV:+${ABBREV}-}"   # project abbreviation, prepended to every release jar name
           ./.github/scripts/modrinth-sync.sh \
             "${MODRINTH_ID}" \
-            "mr.${PRIMARY}.version.${MC_VERSION}" "${PRIMARY_VERSION}" "${PRIMARY} ${PRIMARY_VERSION}" \
-            "dist/${MC_VERSION}/${A}${PRIMARY}-${PRIMARY_VERSION}-universal.jar"
+            "mr.${PRIMARY}.version.${MC_VERSION}" "${PRIMARY_VERSION}-${MC_VERSION}" "${PRIMARY} ${PRIMARY_VERSION}-${MC_VERSION}" \
+            "dist/${MC_VERSION}/${A}${PRIMARY}-${PRIMARY_VERSION}-universal-${MC_VERSION}.jar"
 
       # --- Persist the bumped version / learned Modrinth id back to main -----------------------
       - name: Commit version + release state

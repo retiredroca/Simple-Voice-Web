@@ -150,18 +150,27 @@ if (moduleFile != null) {
     ext.mod_library = (module.getProperty('library') ?: 'false').toBoolean()
 }
 
-// Release jar name: <mod-id>-<version>-<loader>.jar, e.g. redstonepcbs-1.0.1.26092517-fabric.jar.
-// The loader designation is the trailing element, matching the universal jar's own
-// "-universal" suffix, so all three release jars read alike. This is the one copy of the convention:
-// the root build's jar lookups and each loader build's archiveFileName both come from here, so the
-// two cannot drift apart. The id and version are parameters because the root project has no
-// module.properties above it, so mod_id/mod_version are undefined there.
+// Release jar name: <mod-id>-<version>-<loader>-<mc>.jar, e.g.
+// redstonepcbs-1.0.1.26092517-fabric-1.21.1.jar. The loader comes before the Minecraft version so
+// the loader-specific suffix and the universal "-universal" still read alike. This is the one copy
+// of the convention: the root build's jar lookups and each loader build's archiveFileName both come
+// from here, so the two cannot drift apart. The id and version are parameters because the root
+// project has no module.properties above it, so mod_id/mod_version are undefined there.
+//
+// Maven/build sources jars keep the old <id>-<version>-sources.jar name. Release copies use the
+// "<loader>-sources" name, which does get the Minecraft suffix.
 //
 // The project abbreviation (abbrev in versions.properties) is prepended so jars from different
 // projects cannot collide when installed side by side. It is empty for a single-module project.
 def abbrev = (componentVersions.getProperty('abbrev') ?: '').trim()
+def jarMc = {
+    def mc = project.findProperty('targetMc') ?: project.findProperty('mc')
+    return mc == null ? '' : mc.toString()
+}
 ext.jarFileName = { String id, String version, String loader ->
-    "${abbrev ? abbrev + '-' : ''}${id}-${version}-${loader}.jar"
+    def mc = jarMc()
+    def mcPart = (loader == 'sources' || mc.isEmpty()) ? '' : "-${mc}"
+    "${abbrev ? abbrev + '-' : ''}${id}-${version}-${loader}${mcPart}.jar"
 }
 
 // A dependency's floor range: [<major.minor.patch>,<upper>). Unused in a single-mod project, but
