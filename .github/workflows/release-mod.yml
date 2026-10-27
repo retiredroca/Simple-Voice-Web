@@ -65,9 +65,10 @@ jobs:
           # release jars there too.
           mkdir -p build/libs
           # Only the mod jars: a sources jar is not a platform artifact, and mc-publish's
-          # default `files` glob over build/libs would pick one up.
+          # default `files` glob over build/libs would pick one up. A sources jar carries the
+          # Minecraft suffix as well (...-fabric-sources-<mc>.jar), so both shapes are skipped.
           for jar in "dist/${MC_VERSION}"/*.jar; do
-            case "$jar" in *-sources.jar) continue ;; esac
+            case "$jar" in *-sources.jar|*-sources-*.jar) continue ;; esac
             cp "$jar" build/libs/
           done
 
