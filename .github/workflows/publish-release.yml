@@ -1,9 +1,8 @@
 name: Publish Release to Platforms
 
 # Publishes an existing GitHub release's jars to CurseForge/Modrinth (no build). The `release:
-# published` event is the normal trigger: the tag workflow builds the jars, attaches them to a
-# draft release, and publishes it only when the asset set is complete. A manual dispatch can
-# republish an existing release.
+# published` event is the normal trigger: the local release attaches the jars and publishes it;
+# this workflow only uploads them. A manual dispatch can republish an existing release.
 on:
   release:
     types: [published]

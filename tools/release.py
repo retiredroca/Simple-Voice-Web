@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Local release preparation.
+"""Local release driver.
 
-This script no longer commits, pushes, creates GitHub releases or publishes to CurseForge/Modrinth.
-It has two local phases:
+This script builds every selected version, then creates and publishes the GitHub release from the
+locally built jars. It never commits, and it never uploads to CurseForge/Modrinth.
 
-    python tools/release.py --mod all              # stamp versions and build/verify every version
+    python tools/release.py --mod all              # stamp and build every version
     # commit and push the prepared files yourself
-    python tools/release.py --create-tags          # create the local v<version>-<mc> tags
+    python tools/release.py --create-tags          # push tags + publish the GitHub releases
 
-Pushing those tags triggers the GitHub workflow that builds the release, creates the GitHub release
-with every jar and sources jar, and publishes only the universal jars to CurseForge/Modrinth.
+The release publication triggers the separate publish-release.yml workflow, which uploads only the
+universal jars to CurseForge/Modrinth.
 
 Without --mc, both phases operate on every version under versions/. --mc <mc> restricts them to one.
---local-only stops after the build phase and never creates tags. --bump moves the semantic version
-line and stops; it never commits.
+--local-only stops after the build phase. --bump moves the semantic version line and stops; it never
+commits.
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import versioning
@@ -29,6 +32,7 @@ import versioning
 ROOT = Path(__file__).resolve().parent.parent
 VERSIONS = ROOT / "versions.properties"
 DIST_ROOT = ROOT / "dist"
+UA = "mod-template-release"
 
 # A release jar is [<abbrev>-]<id>-<version>-<kind>-<mc>.jar, matching jarFileName in
 # gradle/versions.gradle. The id group allows dashes so a `bundle-` prefix matches. A sources jar
@@ -216,6 +220,21 @@ def bundle_definitions(mc=None):
     return out
 
 
+def validate_bundles():
+    """Reject bundles that contain exactly the same modules.
+
+    Two bundles with the same member set produce the same jars; they are a duplicate upload and a
+    duplicate release asset. Bundles are only for projects whose bundles differ in membership or
+    dependencies (mcsan), never for a project that has no distinct bundle.
+    """
+    seen = {}
+    for name, ids in bundle_definitions().items():
+        key = tuple(sorted(set(ids)))
+        if key in seen:
+            die(f"bundles '{seen[key]}' and '{name}' contain the same modules; remove one")
+        seen[key] = name
+
+
 def bundle_name(key, version, mc):
     abbrev = (read_props(VERSIONS).get("abbrev") or "").strip()
     prefix = f"{abbrev}-" if abbrev else ""
@@ -381,32 +400,145 @@ def ensure_pushed():
         die(f"{ahead} commit(s) are not pushed; push the prepared commit first")
 
 
+def repo_slug():
+    try:
+        url = capture(["git", "remote", "get-url", "origin"]).strip()
+    except subprocess.CalledProcessError:
+        url = ""
+    match = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
+    return match.group(1) if match else ""
+
+
+def github_token():
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    out = subprocess.run(
+        ["git", "credential", "fill"],
+        input=b"protocol=https\nhost=github.com\n\n",
+        capture_output=True,
+        env=env,
+    ).stdout.decode()
+    for line in out.splitlines():
+        if line.startswith("password="):
+            return line[len("password="):]
+    die("no GITHUB_TOKEN/GH_TOKEN and no stored github.com credential")
+
+
+def gh_request(method, url, token, data=None, content_type="application/vnd.github+json"):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", UA)
+    req.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = resp.read().decode()
+            return resp.status, (json.loads(payload) if payload else {})
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def github_release(token, tag, target, body, dry):
+    """Create the release as a draft; publish_release() flips it once the jars are attached."""
+    if dry:
+        print(f"  [dry-run] create GitHub release {tag} at {target} (draft)")
+        return {"id": 0, "upload_url": ""}
+    slug = repo_slug()
+    if not slug:
+        die("no GitHub origin remote; cannot publish the release")
+    status, resp = gh_request("POST", f"https://api.github.com/repos/{slug}/releases", token, {
+        "tag_name": tag,
+        "target_commitish": target,
+        "name": tag,
+        "body": body,
+        "draft": True,
+        "prerelease": False,
+    })
+    if status not in (200, 201):
+        die(f"GitHub release failed ({status}): {resp}")
+    log(f"GitHub release {tag} created (draft)")
+    return resp
+
+
+def upload_assets(token, release_id, mc, dry):
+    slug = repo_slug()
+    for jar in sorted(dist_dir(mc).glob("*.jar")):
+        if dry:
+            print(f"  [dry-run] upload {jar.name}")
+            continue
+        url = f"https://uploads.github.com/repos/{slug}/releases/{release_id}/assets?name={jar.name}"
+        req = urllib.request.Request(url, data=jar.read_bytes(), method="POST")
+        req.add_header("Authorization", f"token {token}")
+        req.add_header("Content-Type", "application/java-archive")
+        req.add_header("User-Agent", UA)
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            log(f"uploaded {jar.name} ({resp.status})")
+
+
+def publish_release(token, release_id, dry):
+    """Flip the draft release to published; this is what starts the platform workflow."""
+    slug = repo_slug()
+    url = f"https://api.github.com/repos/{slug}/releases/{release_id}"
+    if dry:
+        print(f"  [dry-run] PATCH {url} draft=false")
+        return
+    status, resp = gh_request("PATCH", url, token, {"draft": False})
+    if status != 200:
+        die(f"GitHub release publish failed ({status}): {resp}")
+    log("published the GitHub release; the release event starts the platform publish")
+
+
 def create_tags(versions, args):
     ensure_clean()
     ensure_pushed()
+    validate_bundles()
     current = read_props(VERSIONS)
-    tags = []
+    selected = []
+    seen = set()
     for target in versions:
         tag = tag_for(target, current, args.tag)
-        if tag in tags:
+        if tag in seen:
             die(f"duplicate tag {tag}")
+        seen.add(tag)
         if not args.dry_run and capture(["git", "tag", "--list", tag]).strip():
             die(f"tag {tag} already exists")
-        tags.append(tag)
+        changelog = dist_dir(target) / "changelog.md"
+        if not changelog.is_file():
+            die(f"{changelog} is missing; run the prepare phase first")
+        verify(target, args.dry_run)
+        selected.append((target, tag, changelog))
+
     if args.dry_run:
-        for tag in tags:
+        for target, tag, changelog in selected:
             print(f"  [dry-run] git tag {tag}")
+            print(f"  [dry-run] git push origin {tag}")
+            print(f"  [dry-run] publish GitHub release {tag} from dist/{target}/")
         return
-    for tag in tags:
+
+    token = github_token()
+    target_commit = capture(["git", "rev-parse", "HEAD"]).strip()
+
+    for target, tag, changelog in selected:
         cmd = ["git"]
         if args.unsigned:
             cmd += ["-c", "tag.gpgSign=false", "tag", tag, "-m", f"Release {tag}"]
         else:
             cmd += ["tag", "-s", tag, "-m", f"Release {tag}"]
         run(cmd)
-    log("created local tags: " + ", ".join(tags))
-    for tag in tags:
-        log(f"push it to trigger the release workflow: git push origin {tag}")
+        run(["git", "push", "origin", tag])
+
+    for target, tag, changelog in selected:
+        body = changelog.read_text(encoding="utf-8")
+        release = github_release(token, tag, target_commit, body, False)
+        if release:
+            upload_assets(token, release["id"], target, False)
+            publish_release(token, release["id"], False)
+
+    log("published GitHub releases: " + ", ".join(tag for _, tag, _ in selected))
+    log("the release event starts the platform publish workflow")
 
 
 # --- main ---------------------------------------------------------------------------
@@ -421,7 +553,7 @@ def main():
     ap.add_argument("--tag", default=None,
                     help="explicit tag name for --create-tags (requires --mc)")
     ap.add_argument("--create-tags", action="store_true",
-                    help="create the local per-version tags from the committed versions.properties")
+                    help="push tags and publish the GitHub releases from the prepared dist/<mc>/")
     ap.add_argument("--local-only", action="store_true",
                     help="stamp and build every selected version; never create tags")
     ap.add_argument("--bump", choices=("patch", "minor", "major"), default=None,
@@ -462,6 +594,7 @@ def main():
         die("release preparation requires --mod, or use --create-tags / --bump")
 
     ensure_clean(args.allow_dirty)
+    validate_bundles()
     stamp = versioning.stamp()
     new_versions = bump_all(versions, args.mod, stamp, args.dry_run)
 
@@ -484,6 +617,7 @@ def main():
     else:
         log("next: commit and push the prepared files, then run:")
         log("  python tools/release.py --create-tags" + (f" --mc {args.mc}" if args.mc else ""))
+        log("that pushes the tags, publishes the GitHub release from dist/, and triggers the platform workflow")
 
 
 if __name__ == "__main__":
