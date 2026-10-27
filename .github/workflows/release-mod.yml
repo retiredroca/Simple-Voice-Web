@@ -121,6 +121,8 @@ jobs:
                   k, _, v = line.partition('=')
                   versions[k.strip()] = v.strip()
           abbrev = versions.pop('abbrev', '').strip()   # project setting, not a module
+          module_ids = {p.get('id') for _, p in versioning.modules(mc) if p.get('id')}
+          versions = {c: v for c, v in versions.items() if c in module_ids}
 
           def git(*args):
               return subprocess.run(['git', *args], capture_output=True, text=True).stdout
@@ -203,22 +205,14 @@ jobs:
             "mr.${PRIMARY}.version.${MC_VERSION}" "${PRIMARY_VERSION}-${MC_VERSION}" "${PRIMARY} ${PRIMARY_VERSION}-${MC_VERSION}" \
             "dist/${MC_VERSION}/${A}${PRIMARY}-${PRIMARY_VERSION}-universal-${MC_VERSION}.jar"
 
-      # --- Persist the bumped version / learned Modrinth id back to main -----------------------
-      - name: Commit version + release state
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-          if git diff --quiet -- versions.properties release-state.properties; then
-            echo "No version/state changes to commit."
-            exit 0
-          fi
-
-          git stash push -- versions.properties release-state.properties
-          git fetch origin main
-          git checkout -B main origin/main
-          git stash pop
-          git add versions.properties release-state.properties
-          git commit -m "Release ${{ env.RELEASE_TAG }}: update release state"
-          git push origin main
+      # --- Preserve release-state for the maintainer to commit manually -----------------------
+      # The workflow must not create commits. Upload the updated state so the maintainer can
+      # download and commit it when instructed.
+      - name: Upload release state
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-state-${{ env.RELEASE_TAG }}-${{ env.MC_VERSION }}
+          path: release-state.properties
+          if-no-files-found: ignore
+          retention-days: 30

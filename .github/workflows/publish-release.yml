@@ -1,9 +1,9 @@
 name: Publish Release to Platforms
 
-# Publishes an existing GitHub release's jars to CurseForge/Modrinth (no build). This `release:
-# published` event is the only trigger: tools/release.py creates the release as a draft, attaches
-# the jars, then publishes it, so the event fires on a complete release. Releases the local tool
-# already published (or that must not be published) are skipped via the marker in the body.
+# Publishes an existing GitHub release's jars to CurseForge/Modrinth (no build). The `release:
+# published` event is the normal trigger: the tag workflow builds the jars, attaches them to a
+# draft release, and publishes it only when the asset set is complete. A manual dispatch can
+# republish an existing release.
 on:
   release:
     types: [published]
@@ -23,10 +23,6 @@ jobs:
   # Resolves the tag so a manual run can be started with no input at all: the latest release is used
   # when the field is left blank, and the leading "v" is added if it was omitted.
   resolve:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.release.author.login != 'github-actions[bot]' &&
-       !contains(github.event.release.body, 'mod-template:published'))
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}

@@ -1,0 +1,104 @@
+name: Build and Release Tag
+
+# Triggered by the tags created locally with:
+#   python tools/release.py --create-tags
+# and pushed by the maintainer. The tag commit already carries the stamped versions.properties.
+#
+# The build runs here, not on the maintainer's machine. The GitHub release is created as a draft,
+# every jar and sources jar is attached, and only then is it published. Publishing fires
+# `release: published`, which starts publish-release.yml for CurseForge/Modrinth.
+
+on:
+  push:
+    tags:
+      - 'v*-*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag and version pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            v*-*) ;;
+            *) echo "Not a release tag: $tag" >&2; exit 1 ;;
+          esac
+          mc="${tag##*-}"
+          case "$mc" in
+            *[!A-Za-z0-9._-]*) echo "Invalid Minecraft version from tag: $mc" >&2; exit 1 ;;
+          esac
+          props="versions/${mc}/version.properties"
+          if [ ! -f "$props" ]; then
+            echo "No such Minecraft version: $props" >&2
+            exit 1
+          fi
+          java_ver=$(grep -E '^java_version=' "$props" | head -1 | cut -d= -f2 | tr -d '\r')
+          {
+            echo "MC_VERSION=$mc"
+            echo "RELEASE_TAG=$tag"
+            echo "JAVA_VERSION=${java_ver:-21}"
+          } >> "$GITHUB_ENV"
+          echo "Building $tag for Minecraft $mc (Java ${java_ver:-21})"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -name gradle.properties -not -path '*/build/*' -exec sed -i '/org.gradle.java.home/d' {} +
+          chmod +x ./gradlew
+
+      - name: Build release jars
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib in $(python3 -c "import sys; sys.path.insert(0, 'tools'); import release; print(' '.join(release.library_ids('${MC_VERSION}')))"); do
+            for loader in fabric neoforge; do
+              ./gradlew --no-daemon --console=plain -Pmc="${MC_VERSION}" -p "versions/${MC_VERSION}/${lib}/${loader}" publishMavenJavaPublicationToRepoRepository
+            done
+          done
+          ./gradlew --no-daemon --console=plain -Pmc="${MC_VERSION}" --refresh-dependencies releaseLoaderJars
+          ./gradlew --no-daemon --console=plain -Pmc="${MC_VERSION}" --refresh-dependencies releaseLoaderBundles
+          ./gradlew --no-daemon --console=plain -Pmc="${MC_VERSION}" --refresh-dependencies releaseUniversal
+          ./gradlew --no-daemon --console=plain -Pmc="${MC_VERSION}" --refresh-dependencies releaseUniversalBundles releaseJars
+
+      - name: Stage and verify release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import sys; sys.path.insert(0, 'tools'); import release; release.collect('${MC_VERSION}', False)"
+          python3 -c "import sys; sys.path.insert(0, 'tools'); import release; release.changelog('${RELEASE_TAG}', '${MC_VERSION}', False)"
+          ls -la "dist/${MC_VERSION}"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --notes-file "dist/${MC_VERSION}/changelog.md" \
+            --draft \
+            --verify-tag
+          gh release upload "$RELEASE_TAG" "dist/${MC_VERSION}"/*.jar --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
+          echo "Published $RELEASE_TAG with every staged jar and sources jar."
